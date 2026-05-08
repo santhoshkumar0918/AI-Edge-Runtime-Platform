@@ -1266,7 +1266,6 @@ Treat it like:
 **Document everything.**
 
 Create:
-
 * architecture diagrams
 * ADRs
 * RFCs

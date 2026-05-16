@@ -1,0 +1,12 @@
+# Ignore Rust build artifacts
+/target
+**/target
+
+# Node artifacts
+/client/node_modules
+/client/.next
+
+# Editor
+.vscode/
+.idea/
+.DS_Store

@@ -51,6 +51,64 @@ async fn run_child_process(cmd: &str, dur: Duration) -> Result<()> {
     Ok(())
 }
 
+// Try running Python code with python3 or python. Falls back to shell if Python not available.
+async fn run_python_code(py_code: &str, dur: Duration) -> Result<()> {
+    // try python3 then python
+    for prog in &["python3", "python"] {
+        match Command::new(prog)
+            .arg("-c")
+            .arg(py_code)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(mut child) => {
+                info!(program = %prog, "spawned python runtime");
+
+                let stdout = child.stdout.take().expect("stdout captured");
+                let stderr = child.stderr.take().expect("stderr captured");
+
+                let stdout_task = tokio::spawn(async move {
+                    let mut rdr = BufReader::new(stdout).lines();
+                    while let Ok(Some(line)) = rdr.next_line().await {
+                        info!(%line, "python stdout");
+                    }
+                });
+
+                let stderr_task = tokio::spawn(async move {
+                    let mut rdr = BufReader::new(stderr).lines();
+                    while let Ok(Some(line)) = rdr.next_line().await {
+                        warn!(%line, "python stderr");
+                    }
+                });
+
+                match timeout(dur, child.wait()).await {
+                    Ok(status_res) => {
+                        let status = status_res?;
+                        info!(?status, "python child exited");
+                    }
+                    Err(_) => {
+                        warn!("python child timed out, killing...");
+                        let _ = child.kill().await;
+                    }
+                }
+
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
+                return Ok(());
+            }
+            Err(e) => {
+                debug!(program = %prog, error = %e, "failed to spawn python - trying next");
+            }
+        }
+    }
+
+    // fallback to shell echo demo
+    warn!("python not available, falling back to shell demo");
+    let fallback = "for i in 1 2 3; do echo child-line-$i; sleep 0.2; done";
+    run_child_process(fallback, dur).await
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // initialize tracing subscriber with env filter

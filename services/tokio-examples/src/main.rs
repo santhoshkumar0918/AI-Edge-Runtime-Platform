@@ -4,7 +4,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout, Duration};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 async fn run_child_process(cmd: &str, dur: Duration) -> Result<()> {
@@ -149,9 +149,9 @@ async fn main() -> Result<()> {
 
     // run a child process with timeout
     let child_run = tokio::spawn(async {
-        // command prints lines slowly
-        let cmd = "for i in 1 2 3; do echo child-line-$i; sleep 0.2; done";
-        let _ = run_child_process(cmd, Duration::from_secs(2)).await;
+        // try running python code (falls back to shell if python not available)
+        let py = "import time\nprint('hello-from-python')\ntime.sleep(0.2)\nprint('python-done')";
+        let _ = run_python_code(py, Duration::from_secs(3)).await;
     });
 
     // graceful shutdown: wait for ctrl_c or tasks to finish

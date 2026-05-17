@@ -4,9 +4,11 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout, Duration};
+use tracing::{debug, error, info, warn};
+use tracing_subscriber::EnvFilter;
 
 async fn run_child_process(cmd: &str, dur: Duration) -> Result<()> {
-    println!("starting child: {}", cmd);
+    info!(%cmd, "starting child");
 
     let mut child = Command::new("sh")
         .arg("-c")
@@ -21,24 +23,24 @@ async fn run_child_process(cmd: &str, dur: Duration) -> Result<()> {
     let stdout_task = tokio::spawn(async move {
         let mut rdr = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = rdr.next_line().await {
-            println!("child stdout: {}", line);
+            info!(%line, "child stdout");
         }
     });
 
     let stderr_task = tokio::spawn(async move {
         let mut rdr = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = rdr.next_line().await {
-            eprintln!("child stderr: {}", line);
+            warn!(%line, "child stderr");
         }
     });
 
     match timeout(dur, child.wait()).await {
         Ok(status_res) => {
             let status = status_res?;
-            println!("child exited: {}", status);
+            info!(?status, "child exited");
         }
         Err(_) => {
-            println!("child timed out, killing...");
+            warn!("child timed out, killing...");
             let _ = child.kill().await;
         }
     }
@@ -51,7 +53,11 @@ async fn run_child_process(cmd: &str, dur: Duration) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    println!("tokio mid-level example: starting");
+    // initialize tracing subscriber with env filter
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+
+    info!("tokio mid-level example: starting");
 
     let (tx, mut rx) = mpsc::channel::<String>(2); // bounded channel to show backpressure
 
@@ -60,27 +66,27 @@ async fn main() -> Result<()> {
         for i in 0..5 {
             let msg = format!("msg-{}", i);
             match tx.try_send(msg.clone()) {
-                Ok(_) => println!("producer try_send succeeded: {}", msg),
+                Ok(_) => info!(%msg, "producer try_send succeeded"),
                 Err(e) => {
-                    println!("producer try_send failed, awaiting send: {}", e);
+                    debug!(error = %e, "producer try_send failed, awaiting send");
                     if tx.send(msg.clone()).await.is_err() {
-                        println!("receiver dropped, stopping producer");
+                        warn!("receiver dropped, stopping producer");
                         return;
                     }
                 }
             }
             sleep(Duration::from_millis(150)).await;
         }
-        println!("producer finished")
+        info!("producer finished")
     });
 
     // consumer
     let cons = tokio::spawn(async move {
         while let Some(m) = rx.recv().await {
-            println!("consumer got: {}", m);
+            info!(%m, "consumer got");
             sleep(Duration::from_millis(300)).await; // simulate work
         }
-        println!("consumer exiting");
+        info!("consumer exiting");
     });
 
     // run a child process with timeout
@@ -93,10 +99,10 @@ async fn main() -> Result<()> {
     // graceful shutdown: wait for ctrl_c or tasks to finish
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
-            println!("received Ctrl+C, shutting down");
+            info!("received Ctrl+C, shutting down");
         }
         _ = prod => {
-            println!("producer task completed");
+            info!("producer task completed");
         }
     }
 
@@ -106,6 +112,6 @@ async fn main() -> Result<()> {
     let _ = cons.await;
     let _ = child_run.await;
 
-    println!("tokio mid-level example: finished");
+    info!("tokio mid-level example: finished");
     Ok(())
 }

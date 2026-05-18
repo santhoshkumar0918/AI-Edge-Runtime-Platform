@@ -96,7 +96,7 @@ async fn main() {
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 8081));
     info!(%addr, "runtime-service listening");
-    hyper::Server::bind(&addr)
+    axum::Server::bind(&addr)
         .serve(app.into_make_service())
         .await
         .unwrap();

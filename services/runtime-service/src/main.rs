@@ -2,7 +2,6 @@ use axum::{routing::post, Router};
 use std::net::SocketAddr;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
-use axum::Server;
 
 mod executor;
 mod handlers {
@@ -18,12 +17,9 @@ async fn main() {
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 8081));
     info!(%addr, "runtime-service listening");
-    let std_listener = std::net::TcpListener::bind(addr).expect("bind tcp");
-    std_listener
-        .set_nonblocking(true)
-        .expect("set nonblocking");
-    let server = hyper::Server::from_tcp(std_listener)
-        .expect("from_tcp")
-        .serve(app.into_make_service());
-    server.await.unwrap();
+    // Start using hyper Server bind
+    hyper::Server::bind(&addr)
+        .serve(app.into_make_service())
+        .await
+        .unwrap();
 }

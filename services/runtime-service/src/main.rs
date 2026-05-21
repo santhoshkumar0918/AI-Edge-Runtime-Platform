@@ -17,9 +17,7 @@ async fn main() {
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 8081));
     info!(%addr, "runtime-service listening");
-    // Start using hyper Server bind
-    hyper::Server::bind(&addr)
-        .serve(app.into_make_service())
-        .await
-        .unwrap();
+
+    // Use axum-server to run the app (compatible with axum 0.8)
+    axum_server::bind(addr).serve(app.into_make_service()).await.unwrap();
 }

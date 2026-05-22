@@ -25,3 +25,26 @@ pub async fn run_python(code: &str, dur: Duration) -> anyhow::Result<(String, St
 
     Err(anyhow::anyhow!("no python interpreter found"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::Duration;
+
+    #[tokio::test]
+    async fn test_run_python_success() {
+        let code = r#"print('hello-from-test')"#;
+        let res = run_python(code, Duration::from_secs(2)).await.expect("should run");
+        assert!(res.0.contains("hello-from-test"));
+        assert_eq!(res.2, Some(0));
+    }
+
+    #[tokio::test]
+    async fn test_run_python_timeout() {
+        let code = r#"import time; time.sleep(1); print('done')"#;
+        let res = run_python(code, Duration::from_millis(10)).await;
+        assert!(res.is_err());
+        let err = format!("{}", res.unwrap_err());
+        assert!(err.contains("timed out"));
+    }
+}

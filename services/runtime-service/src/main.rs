@@ -18,7 +18,8 @@ async fn main() {
     let app = Router::new()
         .route("/execute", post(handlers::execute::execute_handler))
         .route("/execute_async", post(handlers::execute::execute_async_handler))
-        .route("/status/:id", get(handlers::execute::status_handler));
+        .route("/status/:id", get(handlers::execute::status_handler))
+        .route("/ws/:id", get(handlers::execute::ws_handler));
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 8081));
     info!(%addr, "runtime-service listening");

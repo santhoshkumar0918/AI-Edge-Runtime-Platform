@@ -6,6 +6,11 @@ use uuid::Uuid;
 use crate::executor;
 use crate::state::JOB_STORE;
 use crate::types::{ExecutionRequest, ExecutionResult};
+use crate::state::BROADCASTS;
+use tokio::sync::broadcast;
+use axum::extract::ws::{WebSocketUpgrade, WebSocket, Message};
+use futures_util::stream::StreamExt;
+use futures_util::sink::SinkExt;
 
 pub async fn execute_handler(Json(req): Json<ExecutionRequest>) -> impl IntoResponse {
     // synchronous/blocking execution (keeps previous behavior)
@@ -57,28 +62,16 @@ pub async fn execute_async_handler(Json(req): Json<ExecutionRequest>) -> impl In
     let id_clone = id.clone();
 
     tokio::spawn(async move {
-        let res = match lang.as_str() {
-            "python" | "py" => executor::run_python(&code, timeout_dur).await,
-            _ => Err(anyhow::anyhow!("unsupported language")),
-        };
-
-        match res {
-            Ok((stdout, stderr, exit_code)) => {
-                let body = ExecutionResult {
-                    id: id_clone.clone(),
-                    status: "completed".into(),
-                    stdout,
-                    stderr,
-                    exit_code,
-                };
-                JOB_STORE.insert(id_clone, Some(body));
+        match lang.as_str() {
+            "python" | "py" => {
+                let _ = executor::run_python_stream(id_clone.clone(), &code, timeout_dur).await;
             }
-            Err(e) => {
+            _ => {
                 let body = ExecutionResult {
                     id: id_clone.clone(),
                     status: "failed".into(),
                     stdout: "".into(),
-                    stderr: format!("{}", e),
+                    stderr: "unsupported language".into(),
                     exit_code: None,
                 };
                 JOB_STORE.insert(id_clone, Some(body));
@@ -106,6 +99,22 @@ pub async fn status_handler(Path(id): Path<String>) -> impl IntoResponse {
     }
 }
 
+pub async fn ws_handler(WebSocketUpgrade(ws): WebSocketUpgrade, Path(id): Path<String>) -> impl IntoResponse {
+    ws.on_upgrade(move |mut socket: WebSocket| async move {
+        // subscribe to broadcasts for this id
+        if let Some(tx) = BROADCASTS.get(&id) {
+            let mut rx = tx.subscribe();
+            while let Ok(msg) = rx.recv().await {
+                if socket.send(Message::Text(msg)).await.is_err() {
+                    break;
+                }
+            }
+        } else {
+            let _ = socket.send(Message::Text("no job or no logs".into())).await;
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,7 +134,7 @@ mod tests {
         let resp = execute_handler(Json(req)).await.into_response();
         let status = resp.status();
         assert_eq!(status, StatusCode::OK);
-        let body_bytes = body::to_bytes(resp.into_body()).await.unwrap();
+        let body_bytes = body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
         let v: ExecutionResult = serde_json::from_slice(&body_bytes).unwrap();
         assert!(v.stdout.contains("sync-test"));
     }
@@ -141,7 +150,7 @@ mod tests {
         // schedule
         let resp = execute_async_handler(Json(req)).await.into_response();
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
-        let body_bytes = body::to_bytes(resp.into_body()).await.unwrap();
+        let body_bytes = body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
         let v: Value = serde_json::from_slice(&body_bytes).unwrap();
         let id = v.get("id").and_then(|s| s.as_str()).expect("id present").to_string();
 
@@ -152,7 +161,7 @@ mod tests {
                 panic!("job did not complete in time");
             }
             let status_resp = status_handler(axum::extract::Path(id.clone())).await.into_response();
-            let status_bytes = body::to_bytes(status_resp.into_body()).await.unwrap();
+            let status_bytes = body::to_bytes(status_resp.into_body(), 64 * 1024).await.unwrap();
             let status_val: Value = serde_json::from_slice(&status_bytes).unwrap();
             if status_val.get("status").and_then(|s| s.as_str()) == Some("running") {
                 tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;

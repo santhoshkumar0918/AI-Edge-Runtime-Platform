@@ -105,3 +105,63 @@ pub async fn status_handler(Path(id): Path<String>) -> impl IntoResponse {
         (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not found"})))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::response::IntoResponse;
+    use axum::body;
+    use serde_json::Value;
+    use std::time::{Duration as StdDuration, Instant};
+
+    #[tokio::test]
+    async fn test_execute_handler_sync() {
+        let req = ExecutionRequest {
+            language: "python".into(),
+            code: "print('sync-test')".into(),
+            timeout_ms: Some(2000),
+        };
+
+        let resp = execute_handler(Json(req)).await.into_response();
+        let status = resp.status();
+        assert_eq!(status, StatusCode::OK);
+        let body_bytes = body::to_bytes(resp.into_body()).await.unwrap();
+        let v: ExecutionResult = serde_json::from_slice(&body_bytes).unwrap();
+        assert!(v.stdout.contains("sync-test"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_async_flow() {
+        let req = ExecutionRequest {
+            language: "python".into(),
+            code: "print('async-test')".into(),
+            timeout_ms: Some(2000),
+        };
+
+        // schedule
+        let resp = execute_async_handler(Json(req)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body_bytes = body::to_bytes(resp.into_body()).await.unwrap();
+        let v: Value = serde_json::from_slice(&body_bytes).unwrap();
+        let id = v.get("id").and_then(|s| s.as_str()).expect("id present").to_string();
+
+        // poll status until completed (with timeout)
+        let start = Instant::now();
+        loop {
+            if start.elapsed() > StdDuration::from_secs(5) {
+                panic!("job did not complete in time");
+            }
+            let status_resp = status_handler(axum::extract::Path(id.clone())).await.into_response();
+            let status_bytes = body::to_bytes(status_resp.into_body()).await.unwrap();
+            let status_val: Value = serde_json::from_slice(&status_bytes).unwrap();
+            if status_val.get("status").and_then(|s| s.as_str()) == Some("running") {
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                continue;
+            }
+            // must be completed or failed
+            assert!(status_val.get("status").is_some());
+            assert!(status_val.get("id").is_some());
+            break;
+        }
+    }
+}

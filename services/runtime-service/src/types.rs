@@ -7,7 +7,7 @@ pub struct ExecutionRequest {
     pub timeout_ms: Option<u64>,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct ExecutionResult {
     pub id: String,
     pub status: String,

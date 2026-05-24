@@ -9,9 +9,28 @@ use crate::state::JOB_STORE;
 use uuid::Uuid;
 
 pub async fn run_python(code: &str, dur: Duration) -> anyhow::Result<(String, String, Option<i32>)> {
+    // optional prlimit wrapper
+    let prlimit_enabled = std::env::var("PRLIMIT_ENABLED").unwrap_or_default() == "1";
+    let prlimit_mem_mb: u64 = std::env::var("PRLIMIT_MEM_MB").ok().and_then(|s| s.parse().ok()).unwrap_or(128);
+    let prlimit_cpu_secs: u64 = std::env::var("PRLIMIT_CPU").ok().and_then(|s| s.parse().ok()).unwrap_or(2);
+
     for prog in &["python3", "python"] {
-        let mut cmd = Command::new(prog);
-        cmd.arg("-c").arg(code);
+        // build command, possibly wrapped by prlimit
+        let mut cmd = if prlimit_enabled {
+            let mut c = Command::new("prlimit");
+            let as_bytes = prlimit_mem_mb * 1024 * 1024;
+            c.arg(format!("--as={}" , as_bytes));
+            c.arg(format!("--cpu={}" , prlimit_cpu_secs));
+            c.arg("--");
+            c.arg(prog);
+            c.arg("-c");
+            c.arg(code);
+            c
+        } else {
+            let mut c = Command::new(prog);
+            c.arg("-c").arg(code);
+            c
+        };
         match timeout(dur, cmd.output()).await {
             Ok(Ok(output)) => {
                 let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -37,10 +56,29 @@ pub async fn run_python_stream(id: String, code: &str, dur: Duration) -> anyhow:
     let (tx, _rx) = broadcast::channel(100);
     BROADCASTS.insert(id.clone(), tx.clone());
 
+    // read prlimit settings
+    let prlimit_enabled = std::env::var("PRLIMIT_ENABLED").unwrap_or_default() == "1";
+    let prlimit_mem_mb: u64 = std::env::var("PRLIMIT_MEM_MB").ok().and_then(|s| s.parse().ok()).unwrap_or(128);
+    let prlimit_cpu_secs: u64 = std::env::var("PRLIMIT_CPU").ok().and_then(|s| s.parse().ok()).unwrap_or(2);
+
     for prog in &["python3", "python"] {
-        let mut cmd = Command::new(prog);
-        cmd.arg("-c").arg(code);
-        match cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn() {
+        // prepare command maybe wrapped by prlimit
+        let mut base = if prlimit_enabled {
+            let mut c = Command::new("prlimit");
+            let as_bytes = prlimit_mem_mb * 1024 * 1024;
+            c.arg(format!("--as={}" , as_bytes));
+            c.arg(format!("--cpu={}" , prlimit_cpu_secs));
+            c.arg("--");
+            c.arg(prog);
+            c.arg("-c");
+            c.arg(code);
+            c
+        } else {
+            let mut c = Command::new(prog);
+            c.arg("-c").arg(code);
+            c
+        };
+        match base.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn() {
             Ok(mut child) => {
                 // read stdout
                 if let Some(stdout) = child.stdout.take() {

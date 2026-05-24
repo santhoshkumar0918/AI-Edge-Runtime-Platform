@@ -1,0 +1,11 @@
+version: '3.8'
+services:
+  runtime-service:
+    build: .
+    ports:
+      - "8081:8081"
+    environment:
+      - API_KEYS=devkey
+      - PRLIMIT_ENABLED=1
+      - PRLIMIT_MEM_MB=128
+      - PRLIMIT_CPU=2

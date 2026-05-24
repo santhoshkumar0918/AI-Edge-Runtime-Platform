@@ -9,8 +9,6 @@ use crate::types::{ExecutionRequest, ExecutionResult};
 use crate::state::BROADCASTS;
 use tokio::sync::broadcast;
 use axum::extract::ws::{WebSocketUpgrade, WebSocket, Message};
-use futures_util::stream::StreamExt;
-use futures_util::sink::SinkExt;
 
 pub async fn execute_handler(Json(req): Json<ExecutionRequest>) -> impl IntoResponse {
     // synchronous/blocking execution (keeps previous behavior)
@@ -99,13 +97,13 @@ pub async fn status_handler(Path(id): Path<String>) -> impl IntoResponse {
     }
 }
 
-pub async fn ws_handler(WebSocketUpgrade(ws): WebSocketUpgrade, Path(id): Path<String>) -> impl IntoResponse {
+pub async fn ws_handler(ws: WebSocketUpgrade, Path(id): Path<String>) -> impl IntoResponse {
     ws.on_upgrade(move |mut socket: WebSocket| async move {
         // subscribe to broadcasts for this id
         if let Some(tx) = BROADCASTS.get(&id) {
             let mut rx = tx.subscribe();
             while let Ok(msg) = rx.recv().await {
-                if socket.send(Message::Text(msg)).await.is_err() {
+                if socket.send(Message::Text(msg.into())).await.is_err() {
                     break;
                 }
             }

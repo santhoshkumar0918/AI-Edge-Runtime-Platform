@@ -7,7 +7,6 @@ use crate::executor;
 use crate::state::JOB_STORE;
 use crate::types::{ExecutionRequest, ExecutionResult};
 use crate::state::BROADCASTS;
-use tokio::sync::broadcast;
 use axum::extract::ws::{WebSocketUpgrade, WebSocket, Message};
 
 pub async fn execute_handler(Json(req): Json<ExecutionRequest>) -> impl IntoResponse {

@@ -1,140 +1,221 @@
-use tokio::process::Command;
-use tokio::time::{timeout, Duration};
-use tracing::debug;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::broadcast;
-use crate::state::BROADCASTS;
-use crate::types::ExecutionResult;
-use crate::state::JOB_STORE;
-use uuid::Uuid;
+use std::{io::Write, path::Path, sync::Arc};
 
-pub async fn run_python(code: &str, dur: Duration) -> anyhow::Result<(String, String, Option<i32>)> {
-    // optional prlimit wrapper
-    let prlimit_enabled = std::env::var("PRLIMIT_ENABLED").unwrap_or_default() == "1";
-    let prlimit_mem_mb: u64 = std::env::var("PRLIMIT_MEM_MB").ok().and_then(|s| s.parse().ok()).unwrap_or(128);
-    let prlimit_cpu_secs: u64 = std::env::var("PRLIMIT_CPU").ok().and_then(|s| s.parse().ok()).unwrap_or(2);
+use anyhow::Context;
+use tempfile::NamedTempFile;
+use tokio::{
+    io::{AsyncBufReadExt, BufReader},
+    process::Command,
+    sync::{broadcast, Mutex},
+    time::{timeout, Duration},
+};
 
-    for prog in &["python3", "python"] {
-        // build command, possibly wrapped by prlimit
-        let mut cmd = if prlimit_enabled {
-            let mut c = Command::new("prlimit");
-            let as_bytes = prlimit_mem_mb * 1024 * 1024;
-            c.arg(format!("--as={}" , as_bytes));
-            c.arg(format!("--cpu={}" , prlimit_cpu_secs));
-            c.arg("--");
-            c.arg(prog);
-            c.arg("-c");
-            c.arg(code);
-            c
-        } else {
-            let mut c = Command::new(prog);
-            c.arg("-c").arg(code);
-            c
-        };
-        match timeout(dur, cmd.output()).await {
-            Ok(Ok(output)) => {
-                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                let code = output.status.code();
-                return Ok((stdout, stderr, code));
-            }
-            Ok(Err(e)) => {
-                debug!(program = %prog, error = %e, "failed to run with program");
-                continue;
-            }
-            Err(_) => {
-                return Err(anyhow::anyhow!("execution timed out"));
-            }
+use crate::{
+    state::{BROADCASTS, JOB_STORE},
+    types::ExecutionResult,
+};
+
+const DEFAULT_CONTAINER_IMAGE: &str = "python:3.12-slim";
+const SANDBOX_DIR: &str = "/sandbox";
+const SANDBOX_SCRIPT_PATH: &str = "/sandbox/main.py";
+
+#[derive(Debug, Clone)]
+struct SandboxConfig {
+    image: String,
+    memory_mb: u64,
+    cpus: String,
+    pids_limit: u64,
+}
+
+impl SandboxConfig {
+    fn from_env() -> Self {
+        Self {
+            image: std::env::var("EXECUTOR_IMAGE").unwrap_or_else(|_| DEFAULT_CONTAINER_IMAGE.to_string()),
+            memory_mb: std::env::var("EXECUTOR_MEMORY_MB")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(256),
+            cpus: std::env::var("EXECUTOR_CPUS").unwrap_or_else(|_| "1.0".to_string()),
+            pids_limit: std::env::var("EXECUTOR_PIDS_LIMIT")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(64),
         }
     }
+}
 
-    Err(anyhow::anyhow!("no python interpreter found"))
+fn write_code_to_tempfile(code: &str) -> anyhow::Result<NamedTempFile> {
+    let mut file = NamedTempFile::new().context("failed to create sandbox source file")?;
+    std::io::Write::write_all(&mut file, code.as_bytes()).context("failed to write sandbox source file")?;
+    file.flush().context("failed to flush sandbox source file")?;
+    Ok(file)
+}
+
+fn docker_command(script_path: &Path, config: &SandboxConfig) -> Command {
+    let mut command = Command::new("docker");
+    command
+        .arg("run")
+        .arg("--rm")
+        .arg("--network")
+        .arg("none")
+        .arg("--cap-drop")
+        .arg("ALL")
+        .arg("--security-opt")
+        .arg("no-new-privileges")
+        .arg("--pids-limit")
+        .arg(config.pids_limit.to_string())
+        .arg("--memory")
+        .arg(format!("{}m", config.memory_mb))
+        .arg("--cpus")
+        .arg(&config.cpus)
+        .arg("--read-only")
+        .arg("--tmpfs")
+        .arg(format!("{}:rw,noexec,nosuid,size=64m", SANDBOX_DIR))
+        .arg("-v")
+        .arg(format!("{}:{}:ro", script_path.display(), SANDBOX_SCRIPT_PATH))
+        .arg(&config.image)
+        .arg("python")
+        .arg("-u")
+        .arg(SANDBOX_SCRIPT_PATH);
+    command
+}
+
+async fn run_container_python(code: &str, dur: Duration) -> anyhow::Result<(String, String, Option<i32>)> {
+    let script = write_code_to_tempfile(code)?;
+    let config = SandboxConfig::from_env();
+
+    let mut command = docker_command(script.path(), &config);
+    match timeout(dur, command.output()).await {
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            Ok((stdout, stderr, output.status.code()))
+        }
+        Ok(Err(e)) => Err(anyhow::anyhow!("failed to start sandbox container: {}", e)),
+        Err(_) => Err(anyhow::anyhow!("execution timed out")),
+    }
+}
+
+async fn pump_stream_lines<R>(
+    mut reader: tokio::io::Lines<BufReader<R>>,
+    prefix: &'static str,
+    tx: broadcast::Sender<String>,
+    buffer: Arc<Mutex<String>>,
+)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    while let Ok(Some(line)) = reader.next_line().await {
+        {
+            let mut acc = buffer.lock().await;
+            acc.push_str(&line);
+            acc.push('\n');
+        }
+        let _ = tx.send(format!("{} {}", prefix, line));
+    }
+}
+
+async fn finalize_job(id: &str, tx: &broadcast::Sender<String>, status: &str, stdout: String, stderr: String, exit_code: Option<i32>) {
+    let result = ExecutionResult {
+        id: id.to_string(),
+        status: status.to_string(),
+        stdout,
+        stderr,
+        exit_code,
+    };
+    JOB_STORE.insert(id.to_string(), Some(result));
+    let _ = tx.send(format!("DONE: exit={:?}", exit_code));
+    BROADCASTS.remove(id);
+}
+
+pub async fn run_python(code: &str, dur: Duration) -> anyhow::Result<(String, String, Option<i32>)> {
+    run_container_python(code, dur).await
 }
 
 pub async fn run_python_stream(id: String, code: &str, dur: Duration) -> anyhow::Result<()> {
-    // create broadcast channel for this job
     let (tx, _rx) = broadcast::channel(100);
     BROADCASTS.insert(id.clone(), tx.clone());
 
-    // read prlimit settings
-    let prlimit_enabled = std::env::var("PRLIMIT_ENABLED").unwrap_or_default() == "1";
-    let prlimit_mem_mb: u64 = std::env::var("PRLIMIT_MEM_MB").ok().and_then(|s| s.parse().ok()).unwrap_or(128);
-    let prlimit_cpu_secs: u64 = std::env::var("PRLIMIT_CPU").ok().and_then(|s| s.parse().ok()).unwrap_or(2);
+    let script = write_code_to_tempfile(code)?;
+    let config = SandboxConfig::from_env();
+    let mut command = docker_command(script.path(), &config);
+    command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
 
-    for prog in &["python3", "python"] {
-        // prepare command maybe wrapped by prlimit
-        let mut base = if prlimit_enabled {
-            let mut c = Command::new("prlimit");
-            let as_bytes = prlimit_mem_mb * 1024 * 1024;
-            c.arg(format!("--as={}" , as_bytes));
-            c.arg(format!("--cpu={}" , prlimit_cpu_secs));
-            c.arg("--");
-            c.arg(prog);
-            c.arg("-c");
-            c.arg(code);
-            c
-        } else {
-            let mut c = Command::new(prog);
-            c.arg("-c").arg(code);
-            c
-        };
-        match base.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn() {
-            Ok(mut child) => {
-                // read stdout
-                if let Some(stdout) = child.stdout.take() {
-                    let mut reader = BufReader::new(stdout).lines();
-                    while let Ok(Some(line)) = reader.next_line().await {
-                        let _ = tx.send(format!("OUT: {}", line));
-                    }
-                }
-                // read stderr (not streamed concurrently for simplicity)
-                let output = timeout(dur, child.wait_with_output()).await;
-                match output {
-                    Ok(Ok(output)) => {
-                        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                        let code = output.status.code();
-                        let result = ExecutionResult {
-                            id: id.clone(),
-                            status: "completed".into(),
-                            stdout: stdout.clone(),
-                            stderr: stderr.clone(),
-                            exit_code: code,
-                        };
-                        JOB_STORE.insert(id.clone(), Some(result));
-                        let _ = tx.send(format!("DONE: exit={:?}", code));
-                        BROADCASTS.remove(&id);
-                        return Ok(());
-                    }
-                    Ok(Err(e)) => {
-                        let err = format!("error: {}", e);
-                        JOB_STORE.insert(id.clone(), Some(ExecutionResult { id: id.clone(), status: "failed".into(), stdout: "".into(), stderr: err.clone(), exit_code: None }));
-                        let _ = tx.send(format!("ERR: {}", err));
-                        BROADCASTS.remove(&id);
-                        return Ok(());
-                    }
-                    Err(_) => {
-                        let err = "execution timed out".to_string();
-                        JOB_STORE.insert(id.clone(), Some(ExecutionResult { id: id.clone(), status: "failed".into(), stdout: "".into(), stderr: err.clone(), exit_code: None }));
-                        let _ = tx.send(format!("TIMEOUT"));
-                        BROADCASTS.remove(&id);
-                        return Ok(());
-                    }
-                }
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            let err = format!("failed to start sandbox container: {}", e);
+            JOB_STORE.insert(
+                id.clone(),
+                Some(ExecutionResult {
+                    id: id.clone(),
+                    status: "failed".into(),
+                    stdout: "".into(),
+                    stderr: err.clone(),
+                    exit_code: None,
+                }),
+            );
+            let _ = tx.send(format!("ERR: {}", err));
+            BROADCASTS.remove(&id);
+            return Ok(());
+        }
+    };
+
+    let stdout_buffer = Arc::new(Mutex::new(String::new()));
+    let stderr_buffer = Arc::new(Mutex::new(String::new()));
+
+    let stdout_task = child.stdout.take().map(|stdout| {
+        let tx = tx.clone();
+        let buffer = Arc::clone(&stdout_buffer);
+        tokio::spawn(async move {
+            pump_stream_lines(BufReader::new(stdout).lines(), "OUT:", tx, buffer).await;
+        })
+    });
+
+    let stderr_task = child.stderr.take().map(|stderr| {
+        let tx = tx.clone();
+        let buffer = Arc::clone(&stderr_buffer);
+        tokio::spawn(async move {
+            pump_stream_lines(BufReader::new(stderr).lines(), "ERR:", tx, buffer).await;
+        })
+    });
+
+    match timeout(dur, child.wait()).await {
+        Ok(Ok(status)) => {
+            if let Some(task) = stdout_task {
+                let _ = task.await;
             }
-            Err(e) => {
-                debug!(program = %prog, error = %e, "failed to spawn");
-                continue;
+            if let Some(task) = stderr_task {
+                let _ = task.await;
             }
+
+            let stdout = stdout_buffer.lock().await.clone();
+            let stderr = stderr_buffer.lock().await.clone();
+            finalize_job(&id, &tx, if status.success() { "completed" } else { "failed" }, stdout, stderr, status.code()).await;
+            Ok(())
+        }
+        Ok(Err(e)) => {
+            if let Some(task) = stdout_task {
+                let _ = task.await;
+            }
+            if let Some(task) = stderr_task {
+                let _ = task.await;
+            }
+            let err = format!("error: {}", e);
+            finalize_job(&id, &tx, "failed", String::new(), err, None).await;
+            Ok(())
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            if let Some(task) = stdout_task {
+                let _ = task.await;
+            }
+            if let Some(task) = stderr_task {
+                let _ = task.await;
+            }
+            finalize_job(&id, &tx, "failed", String::new(), "execution timed out".to_string(), None).await;
+            Ok(())
         }
     }
-
-    // no interpreter found
-    let err = "no python interpreter found".to_string();
-    JOB_STORE.insert(id.clone(), Some(ExecutionResult { id: id.clone(), status: "failed".into(), stdout: "".into(), stderr: err.clone(), exit_code: None }));
-    let _ = tx.send(format!("ERR: {}", err));
-    BROADCASTS.remove(&id);
-    Ok(())
 }
 
 #[cfg(test)]

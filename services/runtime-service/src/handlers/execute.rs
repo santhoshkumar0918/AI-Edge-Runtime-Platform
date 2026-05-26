@@ -2,7 +2,6 @@ use axum::{extract::Json, extract::Path, http::StatusCode, response::IntoRespons
 use tokio::time::Duration;
 use tracing::{error, info};
 use uuid::Uuid;
-use axum::http::StatusCode as AxumStatus;
 
 use crate::executor;
 use crate::state::JOB_STORE;
@@ -18,8 +17,14 @@ pub async fn execute_handler(Json(req): Json<ExecutionRequest>) -> impl IntoResp
     // basic validation
     let max_code: usize = std::env::var("MAX_CODE_BYTES").ok().and_then(|s| s.parse().ok()).unwrap_or(10_000);
     if req.code.len() > max_code {
-        let body = serde_json::json!({"error": "code too large"});
-        return (AxumStatus::BAD_REQUEST, Json(body));
+        let body = ExecutionResult {
+            id: id.clone(),
+            status: "failed".into(),
+            stdout: "".into(),
+            stderr: "code too large".into(),
+            exit_code: None,
+        };
+        return (StatusCode::BAD_REQUEST, Json(body));
     }
 
     let timeout_dur = Duration::from_millis(req.timeout_ms.unwrap_or(5000));
@@ -61,7 +66,7 @@ pub async fn execute_async_handler(Json(req): Json<ExecutionRequest>) -> impl In
     let max_code: usize = std::env::var("MAX_CODE_BYTES").ok().and_then(|s| s.parse().ok()).unwrap_or(10_000);
     if req.code.len() > max_code {
         let body = serde_json::json!({"error": "code too large"});
-        return (AxumStatus::BAD_REQUEST, Json(body));
+        return (StatusCode::BAD_REQUEST, Json(body));
     }
 
     // mark as running

@@ -2,6 +2,7 @@ use axum::{extract::Json, extract::Path, http::StatusCode, response::IntoRespons
 use tokio::time::Duration;
 use tracing::{error, info};
 use uuid::Uuid;
+use axum::http::StatusCode as AxumStatus;
 
 use crate::executor;
 use crate::state::JOB_STORE;
@@ -13,6 +14,13 @@ pub async fn execute_handler(Json(req): Json<ExecutionRequest>) -> impl IntoResp
     // synchronous/blocking execution (keeps previous behavior)
     let id = Uuid::new_v4().to_string();
     info!(id = %id, language = %req.language, "starting execution");
+
+    // basic validation
+    let max_code: usize = std::env::var("MAX_CODE_BYTES").ok().and_then(|s| s.parse().ok()).unwrap_or(10_000);
+    if req.code.len() > max_code {
+        let body = serde_json::json!({"error": "code too large"});
+        return (AxumStatus::BAD_REQUEST, Json(body));
+    }
 
     let timeout_dur = Duration::from_millis(req.timeout_ms.unwrap_or(5000));
 
@@ -49,6 +57,12 @@ pub async fn execute_handler(Json(req): Json<ExecutionRequest>) -> impl IntoResp
 pub async fn execute_async_handler(Json(req): Json<ExecutionRequest>) -> impl IntoResponse {
     let id = Uuid::new_v4().to_string();
     info!(id = %id, language = %req.language, "scheduling async execution");
+    // validation
+    let max_code: usize = std::env::var("MAX_CODE_BYTES").ok().and_then(|s| s.parse().ok()).unwrap_or(10_000);
+    if req.code.len() > max_code {
+        let body = serde_json::json!({"error": "code too large"});
+        return (AxumStatus::BAD_REQUEST, Json(body));
+    }
 
     // mark as running
     JOB_STORE.insert(id.clone(), None);
@@ -76,10 +90,11 @@ pub async fn execute_async_handler(Json(req): Json<ExecutionRequest>) -> impl In
         }
     });
 
+    let status_url = format!("/status/{}", id);
     let resp = serde_json::json!({
         "id": id,
         "status": "scheduled",
-        "status_url": "/status/{id}"
+        "status_url": status_url
     });
 
     (StatusCode::ACCEPTED, Json(resp))

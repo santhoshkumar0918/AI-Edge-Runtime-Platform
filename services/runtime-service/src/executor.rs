@@ -8,7 +8,6 @@ use tokio::{
     sync::{broadcast, Mutex},
     time::{timeout, Duration},
 };
-
 use crate::{
     state::{BROADCASTS, JOB_STORE},
     types::ExecutionResult,

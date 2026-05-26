@@ -61,7 +61,8 @@ async fn main() {
         .route("/execute", post(handlers::execute::execute_handler))
         .route("/execute_async", post(handlers::execute::execute_async_handler))
         .route("/status/:id", get(handlers::execute::status_handler))
-        .route("/ws/:id", get(handlers::execute::ws_handler));
+        .route("/ws/:id", get(handlers::execute::ws_handler))
+        .route("/healthz", get(|| async { StatusCode::OK }));
 
     let app = app.layer(Extension(keys)).layer(middleware::from_fn(auth));
 

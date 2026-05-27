@@ -1,7 +1,8 @@
-use std::{io::Write, path::Path, sync::Arc};
+use std::{path::Path, path::PathBuf, sync::Arc};
 
 use anyhow::Context;
-use tempfile::NamedTempFile;
+use uuid::Uuid;
+use tokio::fs;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command,
@@ -42,11 +43,12 @@ impl SandboxConfig {
     }
 }
 
-fn write_code_to_tempfile(code: &str) -> anyhow::Result<NamedTempFile> {
-    let mut file = NamedTempFile::new().context("failed to create sandbox source file")?;
-    std::io::Write::write_all(&mut file, code.as_bytes()).context("failed to write sandbox source file")?;
-    file.flush().context("failed to flush sandbox source file")?;
-    Ok(file)
+async fn write_code_to_tempfile_async(code: &str) -> anyhow::Result<PathBuf> {
+    let dir = std::env::var("EXECUTOR_TMP_DIR").unwrap_or_else(|_| "/tmp".to_string());
+    let name = format!("runtime-{}.py", Uuid::new_v4());
+    let path = PathBuf::from(format!("{}/{}", dir.trim_end_matches('/'), name));
+    fs::write(&path, code.as_bytes()).await.context("failed to write sandbox source file")?;
+    Ok(path)
 }
 
 fn docker_command(script_path: &Path, config: &SandboxConfig) -> Command {
@@ -79,18 +81,26 @@ fn docker_command(script_path: &Path, config: &SandboxConfig) -> Command {
 }
 
 async fn run_container_python(code: &str, dur: Duration) -> anyhow::Result<(String, String, Option<i32>)> {
-    let script = write_code_to_tempfile(code)?;
+    let script_path = write_code_to_tempfile_async(code).await?;
     let config = SandboxConfig::from_env();
 
-    let mut command = docker_command(script.path(), &config);
-    match timeout(dur, command.output()).await {
-        Ok(Ok(output)) => {
+    let mut command = docker_command(&script_path, &config);
+    let output = match timeout(dur, command.output()).await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(e)) => Err(anyhow::anyhow!("failed to start sandbox container: {}", e)),
+        Err(_) => Err(anyhow::anyhow!("execution timed out")),
+    };
+
+    // cleanup tempfile
+    let _ = fs::remove_file(&script_path).await;
+
+    match output {
+        Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             Ok((stdout, stderr, output.status.code()))
         }
-        Ok(Err(e)) => Err(anyhow::anyhow!("failed to start sandbox container: {}", e)),
-        Err(_) => Err(anyhow::anyhow!("execution timed out")),
+        Err(e) => Err(e),
     }
 }
 
@@ -134,9 +144,9 @@ pub async fn run_python_stream(id: String, code: &str, dur: Duration) -> anyhow:
     let (tx, _rx) = broadcast::channel(100);
     BROADCASTS.insert(id.clone(), tx.clone());
 
-    let script = write_code_to_tempfile(code)?;
+    let script_path = write_code_to_tempfile_async(code).await?;
     let config = SandboxConfig::from_env();
-    let mut command = docker_command(script.path(), &config);
+    let mut command = docker_command(&script_path, &config);
     command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
 
     let mut child = match command.spawn() {
@@ -190,6 +200,8 @@ pub async fn run_python_stream(id: String, code: &str, dur: Duration) -> anyhow:
             let stdout = stdout_buffer.lock().await.clone();
             let stderr = stderr_buffer.lock().await.clone();
             finalize_job(&id, &tx, if status.success() { "completed" } else { "failed" }, stdout, stderr, status.code()).await;
+            // cleanup tempfile
+            let _ = fs::remove_file(&script_path).await;
             Ok(())
         }
         Ok(Err(e)) => {
@@ -201,6 +213,7 @@ pub async fn run_python_stream(id: String, code: &str, dur: Duration) -> anyhow:
             }
             let err = format!("error: {}", e);
             finalize_job(&id, &tx, "failed", String::new(), err, None).await;
+            let _ = fs::remove_file(&script_path).await;
             Ok(())
         }
         Err(_) => {
@@ -212,6 +225,7 @@ pub async fn run_python_stream(id: String, code: &str, dur: Duration) -> anyhow:
                 let _ = task.await;
             }
             finalize_job(&id, &tx, "failed", String::new(), "execution timed out".to_string(), None).await;
+            let _ = fs::remove_file(&script_path).await;
             Ok(())
         }
     }

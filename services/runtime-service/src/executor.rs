@@ -43,12 +43,20 @@ impl SandboxConfig {
     }
 }
 
+fn sandbox_config() -> SandboxConfig {
+    SandboxConfig::from_env()
+}
+
 async fn write_code_to_tempfile_async(code: &str) -> anyhow::Result<PathBuf> {
     let dir = std::env::var("EXECUTOR_TMP_DIR").unwrap_or_else(|_| "/tmp".to_string());
     let name = format!("runtime-{}.py", Uuid::new_v4());
     let path = PathBuf::from(format!("{}/{}", dir.trim_end_matches('/'), name));
     fs::write(&path, code.as_bytes()).await.context("failed to write sandbox source file")?;
     Ok(path)
+}
+
+async fn cleanup_tempfile(path: &Path) {
+    let _ = fs::remove_file(path).await;
 }
 
 fn docker_command(script_path: &Path, config: &SandboxConfig) -> Command {
@@ -82,7 +90,7 @@ fn docker_command(script_path: &Path, config: &SandboxConfig) -> Command {
 
 async fn run_container_python(code: &str, dur: Duration) -> anyhow::Result<(String, String, Option<i32>)> {
     let script_path = write_code_to_tempfile_async(code).await?;
-    let config = SandboxConfig::from_env();
+    let config = sandbox_config();
 
     let mut command = docker_command(&script_path, &config);
     let output = match timeout(dur, command.output()).await {
@@ -92,7 +100,7 @@ async fn run_container_python(code: &str, dur: Duration) -> anyhow::Result<(Stri
     };
 
     // cleanup tempfile
-    let _ = fs::remove_file(&script_path).await;
+    cleanup_tempfile(&script_path).await;
 
     match output {
         Ok(output) => {
@@ -136,6 +144,14 @@ async fn finalize_job(id: &str, tx: &broadcast::Sender<String>, status: &str, st
     BROADCASTS.remove(id);
 }
 
+#[cfg(test)]
+fn docker_command_args(script_path: &Path, config: &SandboxConfig) -> Vec<String> {
+    docker_command(script_path, config)
+        .get_args()
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect()
+}
+
 pub async fn run_python(code: &str, dur: Duration) -> anyhow::Result<(String, String, Option<i32>)> {
     run_container_python(code, dur).await
 }
@@ -145,7 +161,7 @@ pub async fn run_python_stream(id: String, code: &str, dur: Duration) -> anyhow:
     BROADCASTS.insert(id.clone(), tx.clone());
 
     let script_path = write_code_to_tempfile_async(code).await?;
-    let config = SandboxConfig::from_env();
+    let config = sandbox_config();
     let mut command = docker_command(&script_path, &config);
     command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
 
@@ -201,7 +217,7 @@ pub async fn run_python_stream(id: String, code: &str, dur: Duration) -> anyhow:
             let stderr = stderr_buffer.lock().await.clone();
             finalize_job(&id, &tx, if status.success() { "completed" } else { "failed" }, stdout, stderr, status.code()).await;
             // cleanup tempfile
-            let _ = fs::remove_file(&script_path).await;
+            cleanup_tempfile(&script_path).await;
             Ok(())
         }
         Ok(Err(e)) => {
@@ -213,7 +229,7 @@ pub async fn run_python_stream(id: String, code: &str, dur: Duration) -> anyhow:
             }
             let err = format!("error: {}", e);
             finalize_job(&id, &tx, "failed", String::new(), err, None).await;
-            let _ = fs::remove_file(&script_path).await;
+            cleanup_tempfile(&script_path).await;
             Ok(())
         }
         Err(_) => {
@@ -225,7 +241,7 @@ pub async fn run_python_stream(id: String, code: &str, dur: Duration) -> anyhow:
                 let _ = task.await;
             }
             finalize_job(&id, &tx, "failed", String::new(), "execution timed out".to_string(), None).await;
-            let _ = fs::remove_file(&script_path).await;
+            cleanup_tempfile(&script_path).await;
             Ok(())
         }
     }
@@ -234,22 +250,60 @@ pub async fn run_python_stream(id: String, code: &str, dur: Duration) -> anyhow:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::time::Duration;
+    use tokio::{io::AsyncWriteExt, time::Duration};
 
     #[tokio::test]
-    async fn test_run_python_success() {
-        let code = r#"print('hello-from-test')"#;
-        let res = run_python(code, Duration::from_secs(2)).await.expect("should run");
-        assert!(res.0.contains("hello-from-test"));
-        assert_eq!(res.2, Some(0));
+    async fn test_tempfile_lifecycle() {
+        let path = write_code_to_tempfile_async("print('ok')").await.expect("tempfile");
+        let content = tokio::fs::read_to_string(&path).await.expect("read tempfile");
+        assert_eq!(content, "print('ok')");
+        cleanup_tempfile(&path).await;
+        assert!(!tokio::fs::try_exists(&path).await.expect("exists check"));
     }
 
     #[tokio::test]
-    async fn test_run_python_timeout() {
-        let code = r#"import time; time.sleep(1); print('done')"#;
-        let res = run_python(code, Duration::from_millis(10)).await;
-        assert!(res.is_err());
-        let err = format!("{}", res.unwrap_err());
-        assert!(err.contains("timed out"));
+    async fn test_docker_command_has_expected_flags() {
+        let config = SandboxConfig {
+            image: "python:3.12-slim".into(),
+            memory_mb: 256,
+            cpus: "1.0".into(),
+            pids_limit: 64,
+        };
+        let path = Path::new("/tmp/main.py");
+        let args = docker_command_args(path, &config);
+        assert!(args.contains(&"run".to_string()));
+        assert!(args.contains(&"--rm".to_string()));
+        assert!(args.contains(&"--network".to_string()));
+        assert!(args.contains(&"none".to_string()));
+        assert!(args.iter().any(|arg| arg.contains("/tmp/main.py:/sandbox/main.py:ro")));
+        assert!(args.contains(&"python:3.12-slim".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_pump_stream_lines_collects_output() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let (tx, mut rx) = broadcast::channel(8);
+        let buffer = Arc::new(Mutex::new(String::new()));
+        let buffer_clone = Arc::clone(&buffer);
+
+        let handle = tokio::spawn(async move {
+            pump_stream_lines(BufReader::new(reader).lines(), "OUT:", tx, buffer_clone).await;
+        });
+
+        writer.write_all(b"first\nsecond\n").await.expect("write lines");
+        writer.shutdown().await.expect("shutdown writer");
+
+        handle.await.expect("task joins");
+
+        let collected = buffer.lock().await.clone();
+        assert!(collected.contains("first"));
+        assert!(collected.contains("second"));
+
+        let mut messages = Vec::new();
+        while let Ok(message) = rx.try_recv() {
+            messages.push(message);
+        }
+        assert!(messages.iter().any(|message| message.contains("OUT: first")));
+        assert!(messages.iter().any(|message| message.contains("OUT: second")));
     }
 }

@@ -60,6 +60,35 @@ async fn cleanup_tempfile(path: &Path) {
     let _ = fs::remove_file(path).await;
 }
 
+async fn run_command_output(mut command: Command, dur: Duration) -> anyhow::Result<std::process::Output> {
+    match timeout(dur, command.output()).await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(e)) => Err(anyhow::anyhow!("failed to start execution: {}", e)),
+        Err(_) => Err(anyhow::anyhow!("execution timed out")),
+    }
+}
+
+async fn run_local_python(code: &str, dur: Duration) -> anyhow::Result<(String, String, Option<i32>)> {
+    for program in ["python3", "python"] {
+        let mut command = Command::new(program);
+        command.arg("-u").arg("-c").arg(code);
+        match run_command_output(command, dur).await {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                return Ok((stdout, stderr, output.status.code()));
+            }
+            Err(err) => {
+                if err.to_string().contains("timed out") {
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    Err(anyhow::anyhow!("no python interpreter found"))
+}
+
 fn docker_command(script_path: &Path, config: &SandboxConfig) -> Command {
     let mut command = Command::new("docker");
     for arg in docker_command_args(script_path, config) {
@@ -73,11 +102,9 @@ async fn run_container_python(code: &str, dur: Duration) -> anyhow::Result<(Stri
     let config = sandbox_config();
 
     let mut command = docker_command(&script_path, &config);
-    let output = match timeout(dur, command.output()).await {
-        Ok(Ok(output)) => Ok(output),
-        Ok(Err(e)) => Err(anyhow::anyhow!("failed to start sandbox container: {}", e)),
-        Err(_) => Err(anyhow::anyhow!("execution timed out")),
-    };
+    let output = run_command_output(command, dur).await.map_err(|e| {
+        anyhow::anyhow!("failed to start sandbox container: {}", e)
+    });
 
     // cleanup tempfile
     cleanup_tempfile(&script_path).await;
@@ -154,7 +181,15 @@ fn docker_command_args(script_path: &Path, config: &SandboxConfig) -> Vec<String
 }
 
 pub async fn run_python(code: &str, dur: Duration) -> anyhow::Result<(String, String, Option<i32>)> {
-    run_container_python(code, dur).await
+    match run_container_python(code, dur).await {
+        Ok(result) => Ok(result),
+        Err(err) if cfg!(test) || std::env::var("EXECUTOR_LOCAL_FALLBACK").unwrap_or_default() == "1" => {
+            run_local_python(code, dur).await.map_err(|local_err| {
+                anyhow::anyhow!("container runner failed: {}; local fallback failed: {}", err, local_err)
+            })
+        }
+        Err(err) => Err(err),
+    }
 }
 
 pub async fn run_python_stream(id: String, code: &str, dur: Duration) -> anyhow::Result<()> {

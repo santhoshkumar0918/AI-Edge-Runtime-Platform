@@ -62,30 +62,9 @@ async fn cleanup_tempfile(path: &Path) {
 
 fn docker_command(script_path: &Path, config: &SandboxConfig) -> Command {
     let mut command = Command::new("docker");
-    command
-        .arg("run")
-        .arg("--rm")
-        .arg("--network")
-        .arg("none")
-        .arg("--cap-drop")
-        .arg("ALL")
-        .arg("--security-opt")
-        .arg("no-new-privileges")
-        .arg("--pids-limit")
-        .arg(config.pids_limit.to_string())
-        .arg("--memory")
-        .arg(format!("{}m", config.memory_mb))
-        .arg("--cpus")
-        .arg(&config.cpus)
-        .arg("--read-only")
-        .arg("--tmpfs")
-        .arg(format!("{}:rw,noexec,nosuid,size=64m", SANDBOX_DIR))
-        .arg("-v")
-        .arg(format!("{}:{}:ro", script_path.display(), SANDBOX_SCRIPT_PATH))
-        .arg(&config.image)
-        .arg("python")
-        .arg("-u")
-        .arg(SANDBOX_SCRIPT_PATH);
+    for arg in docker_command_args(script_path, config) {
+        command.arg(arg);
+    }
     command
 }
 
@@ -147,10 +126,31 @@ async fn finalize_job(id: &str, tx: &broadcast::Sender<String>, status: &str, st
 
 #[cfg(test)]
 fn docker_command_args(script_path: &Path, config: &SandboxConfig) -> Vec<String> {
-    docker_command(script_path, config)
-        .get_args()
-        .map(|arg| arg.to_string_lossy().to_string())
-        .collect()
+    vec![
+        "run".into(),
+        "--rm".into(),
+        "--network".into(),
+        "none".into(),
+        "--cap-drop".into(),
+        "ALL".into(),
+        "--security-opt".into(),
+        "no-new-privileges".into(),
+        "--pids-limit".into(),
+        config.pids_limit.to_string(),
+        "--memory".into(),
+        format!("{}m", config.memory_mb),
+        "--cpus".into(),
+        config.cpus.clone(),
+        "--read-only".into(),
+        "--tmpfs".into(),
+        format!("{}:rw,noexec,nosuid,size=64m", SANDBOX_DIR),
+        "-v".into(),
+        format!("{}:{}:ro", script_path.display(), SANDBOX_SCRIPT_PATH),
+        config.image.clone(),
+        "python".into(),
+        "-u".into(),
+        SANDBOX_SCRIPT_PATH.into(),
+    ]
 }
 
 pub async fn run_python(code: &str, dur: Duration) -> anyhow::Result<(String, String, Option<i32>)> {
@@ -251,7 +251,7 @@ pub async fn run_python_stream(id: String, code: &str, dur: Duration) -> anyhow:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::{io::AsyncWriteExt, time::Duration};
+    use tokio::io::AsyncWriteExt;
 
     #[tokio::test]
     async fn test_tempfile_lifecycle() {

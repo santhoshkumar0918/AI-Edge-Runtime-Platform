@@ -1,4 +1,4 @@
-use axum::{routing::{get, post}, Router, Extension, middleware};
+use axum::{routing::{get, post, delete}, Router, Extension, middleware};
 use std::sync::Arc;
 use std::collections::HashSet;
 use axum::http::{Request, StatusCode};

@@ -9,8 +9,6 @@ use crate::types::{ExecutionRequest, ExecutionResult};
 use crate::state::BROADCASTS;
 use axum::extract::ws::{WebSocketUpgrade, WebSocket, Message};
 use crate::state::RUNNING_CHILDREN;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 
 pub async fn execute_handler(Json(req): Json<ExecutionRequest>) -> impl IntoResponse {
     // synchronous/blocking execution (keeps previous behavior)

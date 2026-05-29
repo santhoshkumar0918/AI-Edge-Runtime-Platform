@@ -1,5 +1,11 @@
 # AI Edge Runtime Platform
 
+A collection of services and examples for an edge-first AI runtime.
+
+<!-- chore: touched to trigger a contribution push -->
+Last touched: 2026-05-29
+# AI Edge Runtime Platform
+
 ## Building a Distributed AI-Native Serverless Runtime From Scratch
 
 ---

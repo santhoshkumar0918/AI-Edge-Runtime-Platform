@@ -8,6 +8,9 @@ use crate::state::JOB_STORE;
 use crate::types::{ExecutionRequest, ExecutionResult};
 use crate::state::BROADCASTS;
 use axum::extract::ws::{WebSocketUpgrade, WebSocket, Message};
+use crate::state::RUNNING_CHILDREN;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 pub async fn execute_handler(Json(req): Json<ExecutionRequest>) -> impl IntoResponse {
     // synchronous/blocking execution (keeps previous behavior)
@@ -114,6 +117,43 @@ pub async fn status_handler(Path(id): Path<String>) -> impl IntoResponse {
     } else {
         (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not found"})))
     }
+}
+
+pub async fn list_jobs() -> impl IntoResponse {
+    let mut list = Vec::new();
+    for r in JOB_STORE.iter() {
+        let id = r.key().clone();
+        let status = match r.value() {
+            None => "running",
+            Some(res) => &res.status,
+        };
+        list.push(serde_json::json!({"id": id, "status": status}));
+    }
+    (StatusCode::OK, Json(serde_json::json!({"jobs": list})))
+}
+
+pub async fn cancel_job(Path(id): Path<String>) -> impl IntoResponse {
+    // try to kill running child
+    if let Some(slot) = RUNNING_CHILDREN.get(&id) {
+        let mut guard = slot.lock().await;
+        if let Some(child) = guard.as_mut() {
+            let _ = child.kill().await;
+            *guard = None;
+        }
+        JOB_STORE.insert(id.clone(), Some(ExecutionResult { id: id.clone(), status: "cancelled".into(), stdout: "".into(), stderr: "cancelled by user".into(), exit_code: None }));
+        RUNNING_CHILDREN.remove(&id);
+        return (StatusCode::OK, Json(serde_json::json!({"id": id, "status": "cancelled"}))); 
+    }
+
+    (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not running"})))
+}
+
+pub async fn metrics() -> impl IntoResponse {
+    let total = JOB_STORE.len();
+    let running = JOB_STORE.iter().filter(|r| r.value().is_none()).count();
+    let completed = JOB_STORE.iter().filter(|r| r.value().is_some()).count();
+    let resp = serde_json::json!({"total": total, "running": running, "completed": completed});
+    (StatusCode::OK, Json(resp))
 }
 
 pub async fn ws_handler(ws: WebSocketUpgrade, Path(id): Path<String>) -> impl IntoResponse {

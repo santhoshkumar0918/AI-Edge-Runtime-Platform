@@ -101,7 +101,7 @@ async fn run_container_python(code: &str, dur: Duration) -> anyhow::Result<(Stri
     let script_path = write_code_to_tempfile_async(code).await?;
     let config = sandbox_config();
 
-    let mut command = docker_command(&script_path, &config);
+        let command = docker_command(&script_path, &config);
     let output = run_command_output(command, dur).await.map_err(|e| {
         anyhow::anyhow!("failed to start sandbox container: {}", e)
     });

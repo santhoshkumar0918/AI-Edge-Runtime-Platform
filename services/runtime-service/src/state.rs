@@ -11,3 +11,12 @@ use tokio::sync::broadcast;
 pub static BROADCASTS: Lazy<DashMap<String, broadcast::Sender<String>>> = Lazy::new(|| {
     DashMap::new()
 });
+
+use tokio::process::Child;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+// track running child processes (wrapped in Arc<Mutex<..>> so we can kill them)
+pub static RUNNING_CHILDREN: Lazy<DashMap<String, Arc<Mutex<Option<Child>>>>> = Lazy::new(|| {
+    DashMap::new()
+});

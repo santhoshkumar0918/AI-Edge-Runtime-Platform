@@ -11,7 +11,7 @@ use tokio::{
 };
 
 use crate::{
-    state::{BROADCASTS, JOB_STORE},
+    state::{BROADCASTS, JOB_STORE, RUNNING_CHILDREN},
     types::ExecutionResult,
 };
 
@@ -201,8 +201,18 @@ pub async fn run_python_stream(id: String, code: &str, dur: Duration) -> anyhow:
     let mut command = docker_command(&script_path, &config);
     command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
 
+    // prepare a slot to track the running child so we can cancel it from handlers
+    let running_slot = Arc::new(Mutex::new(None));
+    RUNNING_CHILDREN.insert(id.clone(), running_slot.clone());
+
     let mut child = match command.spawn() {
-        Ok(child) => child,
+        Ok(child) => {
+            // place child into the running slot for cancellation
+            let mut guard = running_slot.lock().await;
+            *guard = Some(child);
+            // take it back for local control
+            guard.take().unwrap()
+        }
         Err(e) => {
             let err = format!("failed to start sandbox container: {}", e);
             JOB_STORE.insert(

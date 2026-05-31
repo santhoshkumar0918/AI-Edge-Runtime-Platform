@@ -154,6 +154,32 @@ pub async fn metrics() -> impl IntoResponse {
     (StatusCode::OK, Json(resp))
 }
 
+pub async fn get_job_logs(Path(id): Path<String>) -> impl IntoResponse {
+    if let Some(entry) = JOB_STORE.get(&id) {
+        match entry.value() {
+            None => (StatusCode::ACCEPTED, Json(serde_json::json!({"id": id, "status": "running"}))),
+            Some(res) => (StatusCode::OK, Json(serde_json::json!({"id": id, "stdout": res.stdout, "stderr": res.stderr}))),
+        }
+    } else {
+        (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not found"})))
+    }
+}
+
+pub async fn purge_jobs() -> impl IntoResponse {
+    // attempt to kill any running children
+    for r in RUNNING_CHILDREN.iter() {
+        let slot = r.value().clone();
+        let mut guard = slot.lock().await;
+        if let Some(child) = guard.as_mut() {
+            let _ = child.kill().await;
+        }
+    }
+    JOB_STORE.clear();
+    BROADCASTS.clear();
+    RUNNING_CHILDREN.clear();
+    (StatusCode::OK, Json(serde_json::json!({"status": "purged"})))
+}
+
 pub async fn ws_handler(ws: WebSocketUpgrade, Path(id): Path<String>) -> impl IntoResponse {
     ws.on_upgrade(move |mut socket: WebSocket| async move {
         // subscribe to broadcasts for this id

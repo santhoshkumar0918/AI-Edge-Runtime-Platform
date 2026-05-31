@@ -7,6 +7,7 @@ use axum::middleware::Next;
 use std::net::SocketAddr;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
+use crate::state::RUNNING_CHILDREN;
 
 mod executor;
 mod types;
@@ -72,6 +73,19 @@ async fn main() {
     let addr = SocketAddr::from(([127, 0, 0, 1], 8081));
     info!(%addr, "runtime-service listening");
 
-    // Use axum-server to run the app (compatible with axum 0.8)
-    axum_server::bind(addr).serve(app.into_make_service()).await.unwrap();
+    // graceful shutdown: kill running children on Ctrl-C
+    let shutdown_signal = async move {
+        tokio::signal::ctrl_c().await.expect("failed to listen for ctrl_c");
+        info!("shutdown signal received, terminating running jobs");
+        for r in RUNNING_CHILDREN.iter() {
+            let slot = r.value().clone();
+            let mut guard = slot.lock().await;
+            if let Some(child) = guard.as_mut() {
+                let _ = child.kill().await;
+            }
+        }
+    };
+
+    // Use axum-server to run the app (compatible with axum 0.8) with graceful shutdown
+    axum_server::bind(addr).serve(app.into_make_service()).with_graceful_shutdown(shutdown_signal).await.unwrap();
 }

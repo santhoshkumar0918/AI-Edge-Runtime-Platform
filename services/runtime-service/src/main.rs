@@ -1,7 +1,7 @@
 use axum::{routing::{get, post, delete}, Router, Extension, middleware};
 use std::sync::Arc;
 use std::collections::HashSet;
-use axum::http::{Request, StatusCode};
+use axum::http::Request;
 use axum::response::IntoResponse;
 use axum::middleware::Next;
 use std::net::SocketAddr;
@@ -87,6 +87,10 @@ async fn main() {
         }
     };
 
-    // Use axum-server to run the app (compatible with axum 0.8) with graceful shutdown
-    axum_server::bind(addr).serve(app.into_make_service()).with_graceful_shutdown(shutdown_signal).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(addr).await.expect("bind listener");
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal)
+        .await
+        .unwrap();
 }

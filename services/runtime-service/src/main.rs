@@ -62,8 +62,10 @@ async fn main() {
         .route("/execute_async", post(handlers::execute::execute_async_handler))
         .route("/status/:id", get(handlers::execute::status_handler))
         .route("/ws/:id", get(handlers::execute::ws_handler))
+        .route("/jobs/:id/logs", get(handlers::execute::get_job_logs))
         .route("/jobs", get(handlers::execute::list_jobs))
         .route("/jobs/:id", delete(handlers::execute::cancel_job))
+        .route("/admin/purge", delete(handlers::execute::purge_jobs))
         .route("/metrics", get(handlers::execute::metrics))
         .route("/healthz", get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }))
         .route("/public/summary", get(handlers::execute::public_summary));

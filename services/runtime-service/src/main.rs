@@ -31,7 +31,6 @@ async fn main() {
     let keys = Arc::new(keys);
 
     async fn auth(req: Request<axum::body::Body>, next: Next) -> impl IntoResponse {
-        // allow status endpoint without auth
         let path = req.uri().path().to_string();
         if path.starts_with("/status") || path == "/healthz" || path == "/public/summary" {
             return next.run(req).await;

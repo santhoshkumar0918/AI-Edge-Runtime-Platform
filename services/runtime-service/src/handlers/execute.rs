@@ -178,7 +178,6 @@ pub async fn get_job_logs(Path(id): Path<String>) -> impl IntoResponse {
         (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not found"})))
     }
 }
-
 pub async fn purge_jobs() -> impl IntoResponse {
     for r in RUNNING_CHILDREN.iter() {
         let slot = r.value().clone();

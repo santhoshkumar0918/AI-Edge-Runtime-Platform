@@ -96,6 +96,34 @@ fn docker_command(script_path: &Path, config: &SandboxConfig) -> Command {
     command
 }
 
+fn docker_command_args(script_path: &Path, config: &SandboxConfig) -> Vec<String> {
+    vec![
+        "run".into(),
+        "--rm".into(),
+        "--network".into(),
+        "none".into(),
+        "--cap-drop".into(),
+        "ALL".into(),
+        "--security-opt".into(),
+        "no-new-privileges".into(),
+        "--pids-limit".into(),
+        config.pids_limit.to_string(),
+        "--memory".into(),
+        format!("{}m", config.memory_mb),
+        "--cpus".into(),
+        config.cpus.clone(),
+        "--read-only".into(),
+        "--tmpfs".into(),
+        format!("{}:rw,noexec,nosuid,size=64m", SANDBOX_DIR),
+        "-v".into(),
+        format!("{}:{}:ro", script_path.display(), SANDBOX_SCRIPT_PATH),
+        config.image.clone(),
+        "python".into(),
+        "-u".into(),
+        SANDBOX_SCRIPT_PATH.into(),
+    ]
+}
+
 async fn run_container_python(code: &str, dur: Duration) -> anyhow::Result<(String, String, Option<i32>)> {
     let script_path = write_code_to_tempfile_async(code).await?;
     let config = sandbox_config();

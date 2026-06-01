@@ -1,7 +1,28 @@
 import Image from "next/image";
 import Link from "next/link";
 
-export default function Home(): JSX.Element {
+type RuntimeSummary = {
+  service: string;
+  status: string;
+  total_jobs: number;
+  running_jobs: number;
+  completed_jobs: number;
+};
+
+async function loadRuntimeSummary(): Promise<RuntimeSummary | null> {
+  const baseUrl = process.env.NEXT_PUBLIC_RUNTIME_URL ?? process.env.RUNTIME_URL ?? "http://127.0.0.1:8081";
+  try {
+    const response = await fetch(`${baseUrl}/public/summary`, { cache: "no-store" });
+    if (!response.ok) return null;
+    return (await response.json()) as RuntimeSummary;
+  } catch {
+    return null;
+  }
+}
+
+export default async function Home(): Promise<JSX.Element> {
+  const runtime = await loadRuntimeSummary();
+
   return (
     <div className="min-h-screen bg-gradient-to-b from-white via-zinc-50 to-zinc-100 dark:from-black dark:via-zinc-900 dark:to-black text-zinc-900 dark:text-zinc-100">
       <header className="mx-auto max-w-5xl px-6 py-8 flex items-center justify-between">
@@ -49,6 +70,28 @@ export default function Home(): JSX.Element {
   "code": "print('hello')",
   "timeout_ms": 5000
 }`}</pre>
+            <div className="mt-6 rounded-lg border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-950 p-4">
+              <div className="flex items-center justify-between">
+                <span className="text-sm font-medium">Backend status</span>
+                <span className={`text-xs px-2 py-1 rounded-full ${runtime?.status === "ok" ? "bg-emerald-100 text-emerald-700" : "bg-amber-100 text-amber-700"}`}>
+                  {runtime?.status ?? "offline"}
+                </span>
+              </div>
+              <div className="mt-4 grid grid-cols-3 gap-3 text-center">
+                <div className="rounded-md bg-white dark:bg-zinc-900 p-3">
+                  <div className="text-2xl font-bold">{runtime?.running_jobs ?? 0}</div>
+                  <div className="text-xs text-zinc-500">running</div>
+                </div>
+                <div className="rounded-md bg-white dark:bg-zinc-900 p-3">
+                  <div className="text-2xl font-bold">{runtime?.completed_jobs ?? 0}</div>
+                  <div className="text-xs text-zinc-500">completed</div>
+                </div>
+                <div className="rounded-md bg-white dark:bg-zinc-900 p-3">
+                  <div className="text-2xl font-bold">{runtime?.total_jobs ?? 0}</div>
+                  <div className="text-xs text-zinc-500">total</div>
+                </div>
+              </div>
+            </div>
           </div>
         </section>
 
@@ -85,6 +128,7 @@ export default function Home(): JSX.Element {
         <section id="get-started" className="mt-16 py-8 border-t border-zinc-200 dark:border-zinc-800">
           <h2 className="text-xl font-semibold">Ready to build the engine?</h2>
           <p className="mt-3 text-sm text-zinc-600 dark:text-zinc-400">Follow the repository's README to begin Phase 0: learn async Rust, Docker, and Linux internals.</p>
+          <p className="mt-2 text-sm text-zinc-500 dark:text-zinc-500">Client integration now reads live backend summary data from <code>/public/summary</code>.</p>
         </section>
       </main>
 

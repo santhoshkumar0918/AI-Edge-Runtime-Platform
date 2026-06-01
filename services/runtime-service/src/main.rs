@@ -33,7 +33,7 @@ async fn main() {
     async fn auth(req: Request<axum::body::Body>, next: Next) -> impl IntoResponse {
         // allow status endpoint without auth
         let path = req.uri().path().to_string();
-        if path.starts_with("/status") {
+        if path.starts_with("/status") || path == "/healthz" || path == "/public/summary" {
             return next.run(req).await;
         }
 
@@ -66,7 +66,8 @@ async fn main() {
         .route("/jobs", get(handlers::execute::list_jobs))
         .route("/jobs/:id", delete(handlers::execute::cancel_job))
         .route("/metrics", get(handlers::execute::metrics))
-        .route("/healthz", get(|| async { StatusCode::OK }));
+        .route("/healthz", get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }))
+        .route("/public/summary", get(handlers::execute::public_summary));
 
     let app = app.layer(Extension(keys)).layer(middleware::from_fn(auth));
 

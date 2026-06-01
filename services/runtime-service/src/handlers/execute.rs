@@ -154,6 +154,20 @@ pub async fn metrics() -> impl IntoResponse {
     (StatusCode::OK, Json(resp))
 }
 
+pub async fn public_summary() -> impl IntoResponse {
+    let total = JOB_STORE.len();
+    let running = JOB_STORE.iter().filter(|r| r.value().is_none()).count();
+    let completed = JOB_STORE.iter().filter(|r| r.value().is_some()).count();
+    let resp = serde_json::json!({
+        "service": "runtime-service",
+        "status": "ok",
+        "total_jobs": total,
+        "running_jobs": running,
+        "completed_jobs": completed,
+    });
+    (StatusCode::OK, Json(resp))
+}
+
 pub async fn get_job_logs(Path(id): Path<String>) -> impl IntoResponse {
     if let Some(entry) = JOB_STORE.get(&id) {
         match entry.value() {

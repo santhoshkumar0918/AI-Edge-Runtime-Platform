@@ -1,4 +1,4 @@
-use axum::{extract::Json, extract::Path, http::StatusCode, response::IntoResponse};
+use axum::{extract::Json, extract::Path, extract::Query, http::StatusCode, response::IntoResponse};
 use tokio::time::Duration;
 use tracing::{error, info};
 use uuid::Uuid;
@@ -117,14 +117,24 @@ pub async fn status_handler(Path(id): Path<String>) -> impl IntoResponse {
     }
 }
 
-pub async fn list_jobs() -> impl IntoResponse {
+#[derive(Debug, serde::Deserialize)]
+pub struct ListJobsQuery {
+    status: Option<String>,
+}
+
+pub async fn list_jobs(Query(q): Query<ListJobsQuery>) -> impl IntoResponse {
     let mut list = Vec::new();
     for r in JOB_STORE.iter() {
         let id = r.key().clone();
         let status = match r.value() {
-            None => "running",
-            Some(res) => &res.status,
+            None => "running".to_string(),
+            Some(res) => res.status.clone(),
         };
+        if let Some(filter) = &q.status {
+            if filter != &status {
+                continue;
+            }
+        }
         list.push(serde_json::json!({"id": id, "status": status}));
     }
     (StatusCode::OK, Json(serde_json::json!({"jobs": list})))
@@ -168,15 +178,35 @@ pub async fn public_summary() -> impl IntoResponse {
     (StatusCode::OK, Json(resp))
 }
 
-pub async fn get_job_logs(Path(id): Path<String>) -> impl IntoResponse {
+#[derive(Debug, serde::Deserialize)]
+pub struct LogsQuery {
+    tail: Option<usize>,
+}
+
+pub async fn get_job_logs(Path(id): Path<String>, Query(q): Query<LogsQuery>) -> impl IntoResponse {
     if let Some(entry) = JOB_STORE.get(&id) {
         match entry.value() {
             None => (StatusCode::ACCEPTED, Json(serde_json::json!({"id": id, "status": "running"}))),
-            Some(res) => (StatusCode::OK, Json(serde_json::json!({"id": id, "stdout": res.stdout, "stderr": res.stderr}))),
+            Some(res) => {
+                let tail = q.tail.unwrap_or(0);
+                let stdout = if tail == 0 { res.stdout.clone() } else { take_last_lines(&res.stdout, tail) };
+                let stderr = if tail == 0 { res.stderr.clone() } else { take_last_lines(&res.stderr, tail) };
+                (StatusCode::OK, Json(serde_json::json!({"id": id, "stdout": stdout, "stderr": stderr})))
+            }
         }
     } else {
         (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not found"})))
     }
+}
+
+fn take_last_lines(s: &str, n: usize) -> String {
+    if n == 0 {
+        return s.to_string();
+    }
+    let lines: Vec<&str> = s.lines().collect();
+    let len = lines.len();
+    let start = if n >= len { 0 } else { len - n };
+    lines[start..].join("\n")
 }
 pub async fn purge_jobs() -> impl IntoResponse {
     for r in RUNNING_CHILDREN.iter() {

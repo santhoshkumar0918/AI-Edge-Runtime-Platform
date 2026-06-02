@@ -42,7 +42,6 @@ export default async function Home(): Promise<JSX.Element> {
           <Link href="/" className="text-sm rounded-full px-3 py-1 border">Docs</Link>
         </nav>
       </header>
-
       <main className="mx-auto max-w-5xl px-6 py-16">
         <section className="grid grid-cols-1 md:grid-cols-2 gap-10 items-center">
           <div>

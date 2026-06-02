@@ -182,7 +182,6 @@ pub async fn public_summary() -> impl IntoResponse {
 pub struct LogsQuery {
     tail: Option<usize>,
 }
-
 pub async fn get_job_logs(Path(id): Path<String>, Query(q): Query<LogsQuery>) -> impl IntoResponse {
     if let Some(entry) = JOB_STORE.get(&id) {
         match entry.value() {

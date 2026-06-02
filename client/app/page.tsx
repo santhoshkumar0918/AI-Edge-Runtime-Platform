@@ -1,5 +1,6 @@
 import Image from "next/image";
 import Link from "next/link";
+import dynamic from "next/dynamic";
 
 type RuntimeSummary = {
   service: string;
@@ -22,6 +23,7 @@ async function loadRuntimeSummary(): Promise<RuntimeSummary | null> {
 
 export default async function Home(): Promise<JSX.Element> {
   const runtime = await loadRuntimeSummary();
+  const JobList = dynamic(() => import("../components/JobList"), { ssr: false });
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-white via-zinc-50 to-zinc-100 dark:from-black dark:via-zinc-900 dark:to-black text-zinc-900 dark:text-zinc-100">
@@ -92,6 +94,7 @@ export default async function Home(): Promise<JSX.Element> {
                 </div>
               </div>
             </div>
+            <JobList />
           </div>
         </section>
 

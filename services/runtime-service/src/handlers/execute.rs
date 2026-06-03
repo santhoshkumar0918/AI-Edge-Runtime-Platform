@@ -37,24 +37,32 @@ pub async fn execute_handler(Json(req): Json<ExecutionRequest>) -> impl IntoResp
 
     match res {
         Ok((stdout, stderr, exit_code)) => {
+            let now = chrono::Utc::now().timestamp_millis();
             let body = ExecutionResult {
-                id,
+                id: id.clone(),
                 status: "completed".into(),
                 stdout,
                 stderr,
                 exit_code,
+                created_at: Some(now),
             };
+            crate::state::JOB_META.insert(id.clone(), now);
+            crate::state::JOB_STORE.insert(id.clone(), Some(body.clone()));
             (StatusCode::OK, Json(body))
         }
         Err(e) => {
             error!(%e, "execution failed");
+            let now = chrono::Utc::now().timestamp_millis();
             let body = ExecutionResult {
-                id,
+                id: id.clone(),
                 status: "failed".into(),
                 stdout: "".into(),
                 stderr: format!("{}", e),
                 exit_code: None,
+                created_at: Some(now),
             };
+            crate::state::JOB_META.insert(id.clone(), now);
+            crate::state::JOB_STORE.insert(id.clone(), Some(body.clone()));
             (StatusCode::INTERNAL_SERVER_ERROR, Json(body))
         }
     }

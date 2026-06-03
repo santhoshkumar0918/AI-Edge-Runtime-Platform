@@ -14,4 +14,5 @@ pub struct ExecutionResult {
     pub stdout: String,
     pub stderr: String,
     pub exit_code: Option<i32>,
+    pub created_at: Option<i64>,
 }

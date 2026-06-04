@@ -80,6 +80,8 @@ pub async fn execute_async_handler(Json(req): Json<ExecutionRequest>) -> impl In
 
     // mark as running
     JOB_STORE.insert(id.clone(), None);
+    let now = chrono::Utc::now().timestamp_millis();
+    crate::state::JOB_META.insert(id.clone(), now);
 
     let code = req.code.clone();
     let lang = req.language.clone();
@@ -143,7 +145,13 @@ pub async fn list_jobs(Query(q): Query<ListJobsQuery>) -> impl IntoResponse {
                 continue;
             }
         }
-        list.push(serde_json::json!({"id": id, "status": status}));
+        // try to read created_at from the stored result or from JOB_META
+        let created_at = if let Some(res) = r.value() {
+            res.created_at
+        } else {
+            crate::state::JOB_META.get(&id).map(|v| *v.value())
+        };
+        list.push(serde_json::json!({"id": id, "status": status, "created_at": created_at}));
     }
     (StatusCode::OK, Json(serde_json::json!({"jobs": list})))
 }
@@ -156,7 +164,8 @@ pub async fn cancel_job(Path(id): Path<String>) -> impl IntoResponse {
             let _ = child.kill().await;
             *guard = None;
         }
-        JOB_STORE.insert(id.clone(), Some(ExecutionResult { id: id.clone(), status: "cancelled".into(), stdout: "".into(), stderr: "cancelled by user".into(), exit_code: None }));
+        let created_at = crate::state::JOB_META.get(&id).map(|v| *v.value());
+        JOB_STORE.insert(id.clone(), Some(ExecutionResult { id: id.clone(), status: "cancelled".into(), stdout: "".into(), stderr: "cancelled by user".into(), exit_code: None, created_at }));
         RUNNING_CHILDREN.remove(&id);
         return (StatusCode::OK, Json(serde_json::json!({"id": id, "status": "cancelled"}))); 
     }
@@ -176,12 +185,19 @@ pub async fn public_summary() -> impl IntoResponse {
     let total = JOB_STORE.len();
     let running = JOB_STORE.iter().filter(|r| r.value().is_none()).count();
     let completed = JOB_STORE.iter().filter(|r| r.value().is_some()).count();
+    // compute latest job timestamp if available
+    let mut latest: Option<i64> = None;
+    for m in crate::state::JOB_META.iter() {
+        let v = *m.value();
+        latest = Some(latest.map_or(v, |cur| std::cmp::max(cur, v)));
+    }
     let resp = serde_json::json!({
         "service": "runtime-service",
         "status": "ok",
         "total_jobs": total,
         "running_jobs": running,
         "completed_jobs": completed,
+        "latest_job_at": latest,
     });
     (StatusCode::OK, Json(resp))
 }

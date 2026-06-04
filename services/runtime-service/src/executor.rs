@@ -166,16 +166,33 @@ where
 }
 
 async fn finalize_job(id: &str, tx: &broadcast::Sender<String>, status: &str, stdout: String, stderr: String, exit_code: Option<i32>) {
+    let now = chrono::Utc::now().timestamp_millis();
     let result = ExecutionResult {
         id: id.to_string(),
         status: status.to_string(),
-        stdout,
-        stderr,
+        stdout: stdout.clone(),
+        stderr: stderr.clone(),
         exit_code,
+        created_at: Some(now),
     };
-    JOB_STORE.insert(id.to_string(), Some(result));
+    JOB_STORE.insert(id.to_string(), Some(result.clone()));
+    crate::state::JOB_META.insert(id.to_string(), now);
     let _ = tx.send(format!("DONE: exit={:?}", exit_code));
     BROADCASTS.remove(id);
+
+    // send webhook notification if configured (best-effort)
+    if let Ok(url) = std::env::var("JOB_WEBHOOK_URL") {
+        let payload = serde_json::json!({
+            "id": id,
+            "status": status,
+            "created_at": now,
+            "exit_code": exit_code,
+            "stdout": if result.stdout.len() > 1000 { &result.stdout[..1000] } else { &result.stdout },
+            "stderr": if result.stderr.len() > 1000 { &result.stderr[..1000] } else { &result.stderr },
+        });
+        let client = reqwest::Client::new();
+        let _ = client.post(&url).json(&payload).send().await;
+    }
 }
 
 #[cfg(test)]
@@ -250,6 +267,7 @@ pub async fn run_python_stream(id: String, code: &str, dur: Duration) -> anyhow:
                     stdout: "".into(),
                     stderr: err.clone(),
                     exit_code: None,
+                    created_at: Some(chrono::Utc::now().timestamp_millis()),
                 }),
             );
             let _ = tx.send(format!("ERR: {}", err));

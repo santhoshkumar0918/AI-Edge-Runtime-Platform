@@ -2,7 +2,7 @@
 
 import React, { useEffect, useState } from "react";
 
-type Job = { id: string; status: string; seenAt: number };
+type Job = { id: string; status: string; created_at?: number | null };
 
 type Logs = { stdout: string; stderr: string } | null;
 
@@ -12,8 +12,8 @@ export default function JobList() {
   const [jobs, setJobs] = useState<Job[]>([]);
   const [loading, setLoading] = useState(false);
   const [logs, setLogs] = useState<Record<string, Logs>>({});
-  const [apiKey, setApiKey] = useState<string>("{}");
-  const [sortBy, setSortBy] = useState<"seen" | "status" | "id">("seen");
+  const [apiKey, setApiKey] = useState<string>("");
+  const [sortBy, setSortBy] = useState<"created" | "status" | "id">("created");
 
   async function loadJobs() {
     setLoading(true);
@@ -29,12 +29,8 @@ export default function JobList() {
         return;
       }
       const body = await res.json();
-      const incoming: Job[] = (body.jobs || []).map((j: any) => ({ id: j.id, status: j.status, seenAt: Date.now() }));
-      // merge with existing seenAt if present
-      const seenMap: Record<string, number> = {};
-      jobs.forEach((x) => (seenMap[x.id] = x.seenAt));
-      const merged = incoming.map((x) => ({ ...x, seenAt: seenMap[x.id] || x.seenAt }));
-      setJobs(merged);
+      const incoming: Job[] = (body.jobs || []).map((j: any) => ({ id: j.id, status: j.status, created_at: j.created_at ?? Date.now() }));
+      setJobs(incoming);
     } catch (e) {
       setJobs([]);
     } finally {
@@ -86,7 +82,7 @@ export default function JobList() {
   }, []);
 
   const sorted = [...jobs].sort((a,b) => {
-    if (sortBy === "seen") return b.seenAt - a.seenAt;
+    if (sortBy === "created") return (b.created_at || 0) - (a.created_at || 0);
     if (sortBy === "status") return a.status.localeCompare(b.status);
     return a.id.localeCompare(b.id);
   });
@@ -113,7 +109,7 @@ export default function JobList() {
           </button>
           <label className="text-sm">Sort:</label>
           <select value={sortBy} onChange={(e) => setSortBy(e.target.value as any)} className="text-sm px-2 py-1 border rounded">
-            <option value="seen">Newest</option>
+            <option value="created">Newest</option>
             <option value="status">Status</option>
             <option value="id">ID</option>
           </select>
@@ -127,7 +123,7 @@ export default function JobList() {
               <div className="text-sm text-zinc-700 dark:text-zinc-200">{j.id}</div>
               <div className="text-xs px-2 py-1 rounded-full bg-zinc-100 dark:bg-zinc-800">{j.status}</div>
             </div>
-            <div className="text-xs text-zinc-500">Seen: {new Date(j.seenAt).toLocaleString()}</div>
+            <div className="text-xs text-zinc-500">Created: {new Date(j.created_at || Date.now()).toLocaleString()}</div>
             <div className="flex items-center gap-2">
               <button
                 onClick={() => loadLogs(j.id)}

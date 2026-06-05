@@ -18,13 +18,17 @@ pub async fn execute_handler(Json(req): Json<ExecutionRequest>) -> impl IntoResp
     // basic validation
     let max_code: usize = std::env::var("MAX_CODE_BYTES").ok().and_then(|s| s.parse().ok()).unwrap_or(10_000);
     if req.code.len() > max_code {
+        let now = chrono::Utc::now().timestamp_millis();
         let body = ExecutionResult {
             id: id.clone(),
             status: "failed".into(),
             stdout: "".into(),
             stderr: "code too large".into(),
             exit_code: None,
+            created_at: Some(now),
         };
+        crate::state::JOB_META.insert(id.clone(), now);
+        crate::state::JOB_STORE.insert(id.clone(), Some(body.clone()));
         return (StatusCode::BAD_REQUEST, Json(body));
     }
 
@@ -94,13 +98,16 @@ pub async fn execute_async_handler(Json(req): Json<ExecutionRequest>) -> impl In
                 let _ = executor::run_python_stream(id_clone.clone(), &code, timeout_dur).await;
             }
             _ => {
+                let now = chrono::Utc::now().timestamp_millis();
                 let body = ExecutionResult {
                     id: id_clone.clone(),
                     status: "failed".into(),
                     stdout: "".into(),
                     stderr: "unsupported language".into(),
                     exit_code: None,
+                    created_at: Some(now),
                 };
+                crate::state::JOB_META.insert(id_clone.clone(), now);
                 JOB_STORE.insert(id_clone, Some(body));
             }
         }
@@ -119,7 +126,10 @@ pub async fn execute_async_handler(Json(req): Json<ExecutionRequest>) -> impl In
 pub async fn status_handler(Path(id): Path<String>) -> impl IntoResponse {
     if let Some(entry) = JOB_STORE.get(&id) {
         match entry.value() {
-            None => (StatusCode::ACCEPTED, Json(serde_json::json!({"id": id, "status": "running"}))),
+            None => {
+                let created = crate::state::JOB_META.get(&id).map(|v| *v.value());
+                (StatusCode::ACCEPTED, Json(serde_json::json!({"id": id, "status": "running", "created_at": created})))
+            }
             Some(res) => (StatusCode::OK, Json(serde_json::to_value(res.clone()).unwrap())),
         }
     } else {

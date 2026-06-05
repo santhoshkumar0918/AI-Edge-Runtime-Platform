@@ -13,6 +13,12 @@ use crate::{
     state::{BROADCASTS, JOB_STORE, RUNNING_CHILDREN},
     types::ExecutionResult,
 };
+use serde_json::Value;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+use hex;
+use reqwest;
+use tokio::time::sleep;
 
 const DEFAULT_CONTAINER_IMAGE: &str = "python:3.12-slim";
 const SANDBOX_DIR: &str = "/sandbox";
@@ -179,8 +185,7 @@ async fn finalize_job(id: &str, tx: &broadcast::Sender<String>, status: &str, st
     crate::state::JOB_META.insert(id.to_string(), now);
     let _ = tx.send(format!("DONE: exit={:?}", exit_code));
     BROADCASTS.remove(id);
-
-    // send webhook notification if configured (best-effort)
+    // send webhook notification if configured (best-effort) with signing and retries
     if let Ok(url) = std::env::var("JOB_WEBHOOK_URL") {
         let payload = serde_json::json!({
             "id": id,
@@ -190,8 +195,51 @@ async fn finalize_job(id: &str, tx: &broadcast::Sender<String>, status: &str, st
             "stdout": if result.stdout.len() > 1000 { &result.stdout[..1000] } else { &result.stdout },
             "stderr": if result.stderr.len() > 1000 { &result.stderr[..1000] } else { &result.stderr },
         });
-        let client = reqwest::Client::new();
-        let _ = client.post(&url).json(&payload).send().await;
+
+        let url_clone = url.clone();
+        let payload_clone: Value = payload.clone();
+        // spawn so webhook delivery doesn't block job finalization
+        tokio::spawn(async move {
+            let max_retries: u32 = std::env::var("JOB_WEBHOOK_RETRIES").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+            let secret = std::env::var("JOB_WEBHOOK_SECRET").ok();
+            let client = reqwest::Client::new();
+            let body_str = payload_clone.to_string();
+
+            for attempt in 0..=max_retries {
+                let mut req = client.post(&url_clone).header("content-type", "application/json").body(body_str.clone());
+                // compute HMAC signature if secret provided
+                if let Some(ref sec) = secret {
+                    let mut mac = Hmac::<Sha256>::new_from_slice(sec.as_bytes()).expect("HMAC can take key of any size");
+                    mac.update(body_str.as_bytes());
+                    let sig = mac.finalize().into_bytes();
+                    let sig_hex = hex::encode(sig);
+                    req = req.header("X-Signature", format!("sha256={}", sig_hex));
+                }
+
+                match req.send().await {
+                    Ok(resp) => {
+                        if resp.status().is_success() {
+                            break;
+                        } else {
+                            // non-2xx
+                            tracing::warn!(attempt, url = %url_clone, status = %resp.status(), "webhook delivery non-success");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(attempt, url = %url_clone, error = %e, "webhook delivery failed");
+                    }
+                }
+
+                if attempt == max_retries {
+                    tracing::error!(url = %url_clone, "webhook delivery failed after retries");
+                    break;
+                }
+
+                // exponential backoff (seconds)
+                let backoff_secs = 2u64.pow(attempt.saturating_add(1));
+                sleep(Duration::from_secs(backoff_secs)).await;
+            }
+        });
     }
 }
 

@@ -7,18 +7,18 @@ use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command,
     sync::{broadcast, Mutex},
-    time::{timeout, Duration},
+    time::{timeout, Duration, sleep},
 };
 use crate::{
     state::{BROADCASTS, JOB_STORE, RUNNING_CHILDREN},
     types::ExecutionResult,
 };
+
 use serde_json::Value;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use hex;
 use reqwest;
-use tokio::time::sleep;
 
 const DEFAULT_CONTAINER_IMAGE: &str = "python:3.12-slim";
 const SANDBOX_DIR: &str = "/sandbox";
@@ -36,15 +36,9 @@ impl SandboxConfig {
     fn from_env() -> Self {
         Self {
             image: std::env::var("EXECUTOR_IMAGE").unwrap_or_else(|_| DEFAULT_CONTAINER_IMAGE.to_string()),
-            memory_mb: std::env::var("EXECUTOR_MEMORY_MB")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(256),
+            memory_mb: std::env::var("EXECUTOR_MEMORY_MB").ok().and_then(|value| value.parse().ok()).unwrap_or(256),
             cpus: std::env::var("EXECUTOR_CPUS").unwrap_or_else(|_| "1.0".to_string()),
-            pids_limit: std::env::var("EXECUTOR_PIDS_LIMIT")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(64),
+            pids_limit: std::env::var("EXECUTOR_PIDS_LIMIT").ok().and_then(|value| value.parse().ok()).unwrap_or(64),
         }
     }
 }
@@ -134,7 +128,7 @@ async fn run_container_python(code: &str, dur: Duration) -> anyhow::Result<(Stri
     let script_path = write_code_to_tempfile_async(code).await?;
     let config = sandbox_config();
 
-        let command = docker_command(&script_path, &config);
+    let command = docker_command(&script_path, &config);
     let output = run_command_output(command, dur).await.map_err(|e| {
         anyhow::anyhow!("failed to start sandbox container: {}", e)
     });
@@ -185,203 +179,67 @@ async fn finalize_job(id: &str, tx: &broadcast::Sender<String>, status: &str, st
     crate::state::JOB_META.insert(id.to_string(), now);
     let _ = tx.send(format!("DONE: exit={:?}", exit_code));
     BROADCASTS.remove(id);
-    // send webhook notification if configured (best-effort) with signing and retries
+
+    // delegate webhook delivery to background worker (non-blocking)
+    if std::env::var("JOB_WEBHOOK_URL").is_ok() {
+        let id = id.to_string();
+        let stdout = stdout.clone();
+        let stderr = stderr.clone();
+        tokio::spawn(async move {
+            let _ = send_webhook(&id, status, exit_code, stdout, stderr, now).await;
+        });
+    }
+}
+
+pub(crate) async fn send_webhook(id: &str, status: &str, exit_code: Option<i32>, stdout: String, stderr: String, now: i64) {
     if let Ok(url) = std::env::var("JOB_WEBHOOK_URL") {
         let payload = serde_json::json!({
             "id": id,
             "status": status,
             "created_at": now,
             "exit_code": exit_code,
-            "stdout": if result.stdout.len() > 1000 { &result.stdout[..1000] } else { &result.stdout },
-            "stderr": if result.stderr.len() > 1000 { &result.stderr[..1000] } else { &result.stderr },
+            "stdout": if stdout.len() > 1000 { &stdout[..1000] } else { &stdout },
+            "stderr": if stderr.len() > 1000 { &stderr[..1000] } else { &stderr },
         });
 
         let url_clone = url.clone();
         let payload_clone: Value = payload.clone();
-        // spawn so webhook delivery doesn't block job finalization
-        tokio::spawn(async move {
-            let max_retries: u32 = std::env::var("JOB_WEBHOOK_RETRIES").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
-            let secret = std::env::var("JOB_WEBHOOK_SECRET").ok();
-            let client = reqwest::Client::new();
-            let body_str = payload_clone.to_string();
+        let max_retries: u32 = std::env::var("JOB_WEBHOOK_RETRIES").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+        let secret = std::env::var("JOB_WEBHOOK_SECRET").ok();
 
-            for attempt in 0..=max_retries {
-                let mut req = client.post(&url_clone).header("content-type", "application/json").body(body_str.clone());
-                // compute HMAC signature if secret provided
-                if let Some(ref sec) = secret {
-                    let mut mac = Hmac::<Sha256>::new_from_slice(sec.as_bytes()).expect("HMAC can take key of any size");
-                    mac.update(body_str.as_bytes());
-                    let sig = mac.finalize().into_bytes();
-                    let sig_hex = hex::encode(sig);
-                    req = req.header("X-Signature", format!("sha256={}", sig_hex));
-                }
+        let client = reqwest::Client::new();
+        let body_str = payload_clone.to_string();
 
-                match req.send().await {
-                    Ok(resp) => {
-                        if resp.status().is_success() {
-                            break;
-                        } else {
-                            // non-2xx
-                            tracing::warn!(attempt, url = %url_clone, status = %resp.status(), "webhook delivery non-success");
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(attempt, url = %url_clone, error = %e, "webhook delivery failed");
+        for attempt in 0..=max_retries {
+            let mut req = client.post(&url_clone).header("content-type", "application/json").body(body_str.clone());
+            if let Some(ref sec) = secret {
+                let mut mac = Hmac::<Sha256>::new_from_slice(sec.as_bytes()).expect("HMAC can take key of any size");
+                mac.update(body_str.as_bytes());
+                let sig = mac.finalize().into_bytes();
+                let sig_hex = hex::encode(sig);
+                req = req.header("X-Signature", format!("sha256={}", sig_hex));
+            }
+
+            match req.send().await {
+                Ok(resp) => {
+                    if resp.status().is_success() {
+                        return;
+                    } else {
+                        tracing::warn!(attempt, url = %url_clone, status = %resp.status(), "webhook delivery non-success");
                     }
                 }
-
-                if attempt == max_retries {
-                    tracing::error!(url = %url_clone, "webhook delivery failed after retries");
-                    break;
+                Err(e) => {
+                    tracing::warn!(attempt, url = %url_clone, error = %e, "webhook delivery failed");
                 }
-
-                // exponential backoff (seconds)
-                let backoff_secs = 2u64.pow(attempt.saturating_add(1));
-                sleep(Duration::from_secs(backoff_secs)).await;
-            }
-        });
-    }
-}
-
-#[cfg(test)]
-fn docker_command_args(script_path: &Path, config: &SandboxConfig) -> Vec<String> {
-    vec![
-        "run".into(),
-        "--rm".into(),
-        "--network".into(),
-        "none".into(),
-        "--cap-drop".into(),
-        "ALL".into(),
-        "--security-opt".into(),
-        "no-new-privileges".into(),
-        "--pids-limit".into(),
-        config.pids_limit.to_string(),
-        "--memory".into(),
-        format!("{}m", config.memory_mb),
-        "--cpus".into(),
-        config.cpus.clone(),
-        "--read-only".into(),
-        "--tmpfs".into(),
-        format!("{}:rw,noexec,nosuid,size=64m", SANDBOX_DIR),
-        "-v".into(),
-        format!("{}:{}:ro", script_path.display(), SANDBOX_SCRIPT_PATH),
-        config.image.clone(),
-        "python".into(),
-        "-u".into(),
-        SANDBOX_SCRIPT_PATH.into(),
-    ]
-}
-
-pub async fn run_python(code: &str, dur: Duration) -> anyhow::Result<(String, String, Option<i32>)> {
-    match run_container_python(code, dur).await {
-        Ok(result) => Ok(result),
-        Err(err) if cfg!(test) || std::env::var("EXECUTOR_LOCAL_FALLBACK").unwrap_or_default() == "1" => {
-            run_local_python(code, dur).await.map_err(|local_err| {
-                anyhow::anyhow!("container runner failed: {}; local fallback failed: {}", err, local_err)
-            })
-        }
-        Err(err) => Err(err),
-    }
-}
-
-pub async fn run_python_stream(id: String, code: &str, dur: Duration) -> anyhow::Result<()> {
-    let (tx, _rx) = broadcast::channel(100);
-    BROADCASTS.insert(id.clone(), tx.clone());
-
-    let script_path = write_code_to_tempfile_async(code).await?;
-    let config = sandbox_config();
-    let mut command = docker_command(&script_path, &config);
-    command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
-
-    // prepare a slot to track the running child so we can cancel it from handlers
-    let running_slot = Arc::new(Mutex::new(None));
-    RUNNING_CHILDREN.insert(id.clone(), running_slot.clone());
-
-    let mut child = match command.spawn() {
-        Ok(child) => {
-            // place child into the running slot for cancellation
-            let mut guard = running_slot.lock().await;
-            *guard = Some(child);
-            // take it back for local control
-            guard.take().unwrap()
-        }
-        Err(e) => {
-            let err = format!("failed to start sandbox container: {}", e);
-            JOB_STORE.insert(
-                id.clone(),
-                Some(ExecutionResult {
-                    id: id.clone(),
-                    status: "failed".into(),
-                    stdout: "".into(),
-                    stderr: err.clone(),
-                    exit_code: None,
-                    created_at: Some(chrono::Utc::now().timestamp_millis()),
-                }),
-            );
-            let _ = tx.send(format!("ERR: {}", err));
-            BROADCASTS.remove(&id);
-            return Ok(());
-        }
-    };
-
-    let stdout_buffer = Arc::new(Mutex::new(String::new()));
-    let stderr_buffer = Arc::new(Mutex::new(String::new()));
-
-    let stdout_task = child.stdout.take().map(|stdout| {
-        let tx = tx.clone();
-        let buffer = Arc::clone(&stdout_buffer);
-        tokio::spawn(async move {
-            pump_stream_lines(BufReader::new(stdout).lines(), "OUT:", tx, buffer).await;
-        })
-    });
-
-    let stderr_task = child.stderr.take().map(|stderr| {
-        let tx = tx.clone();
-        let buffer = Arc::clone(&stderr_buffer);
-        tokio::spawn(async move {
-            pump_stream_lines(BufReader::new(stderr).lines(), "ERR:", tx, buffer).await;
-        })
-    });
-
-    match timeout(dur, child.wait()).await {
-        Ok(Ok(status)) => {
-            if let Some(task) = stdout_task {
-                let _ = task.await;
-            }
-            if let Some(task) = stderr_task {
-                let _ = task.await;
             }
 
-            let stdout = stdout_buffer.lock().await.clone();
-            let stderr = stderr_buffer.lock().await.clone();
-            finalize_job(&id, &tx, if status.success() { "completed" } else { "failed" }, stdout, stderr, status.code()).await;
-            // cleanup tempfile
-            cleanup_tempfile(&script_path).await;
-            Ok(())
-        }
-        Ok(Err(e)) => {
-            if let Some(task) = stdout_task {
-                let _ = task.await;
+            if attempt == max_retries {
+                tracing::error!(url = %url_clone, "webhook delivery failed after retries");
+                break;
             }
-            if let Some(task) = stderr_task {
-                let _ = task.await;
-            }
-            let err = format!("error: {}", e);
-            finalize_job(&id, &tx, "failed", String::new(), err, None).await;
-            cleanup_tempfile(&script_path).await;
-            Ok(())
-        }
-        Err(_) => {
-            let _ = child.kill().await;
-            if let Some(task) = stdout_task {
-                let _ = task.await;
-            }
-            if let Some(task) = stderr_task {
-                let _ = task.await;
-            }
-            finalize_job(&id, &tx, "failed", String::new(), "execution timed out".to_string(), None).await;
-            cleanup_tempfile(&script_path).await;
-            Ok(())
+
+            let backoff_secs = 2u64.pow(attempt.saturating_add(1));
+            sleep(Duration::from_secs(backoff_secs)).await;
         }
     }
 }
@@ -390,6 +248,11 @@ pub async fn run_python_stream(id: String, code: &str, dur: Duration) -> anyhow:
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    use axum::{routing::post, Router, extract::Body};
+    use std::sync::Arc;
+    use tokio::sync::oneshot;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[tokio::test]
     async fn test_tempfile_lifecycle() {
@@ -444,5 +307,74 @@ mod tests {
         }
         assert!(messages.iter().any(|message| message.contains("OUT: first")));
         assert!(messages.iter().any(|message| message.contains("OUT: second")));
+    }
+
+    #[tokio::test]
+    async fn test_webhook_signing_and_retry() {
+        // spawn a test server that fails first 2 attempts then succeeds
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c_clone = counter.clone();
+
+        let app = Router::new().route("/", post(move |body: Body, headers: axum::http::HeaderMap| {
+            let c = c_clone.clone();
+            async move {
+                let bytes = hyper::body::to_bytes(body).await.unwrap_or_default();
+                // verify signature if header present
+                if let Some(sig_hdr) = headers.get("x-signature") {
+                    let sig_str = sig_hdr.to_str().unwrap_or_default();
+                    // compute expected
+                    let secret = std::env::var("JOB_WEBHOOK_SECRET").unwrap_or_default();
+                    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC init");
+                    mac.update(&bytes);
+                    let expected = hex::encode(mac.finalize().into_bytes());
+                    let expected_hdr = format!("sha256={}", expected);
+                    if sig_str != expected_hdr {
+                        return (axum::http::StatusCode::UNAUTHORIZED, "bad sig");
+                    }
+                }
+
+                let prev = c.fetch_add(1, Ordering::SeqCst);
+                if prev < 2 {
+                    // fail first two attempts
+                    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "fail")
+                } else {
+                    (axum::http::StatusCode::OK, "ok")
+                }
+            }
+        }));
+
+        // bind to port 0 to get an ephemeral port
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let server = axum::Server::from_tcp(listener).unwrap().serve(app.into_make_service());
+
+        let (tx, rx) = oneshot::channel();
+        let srv_handle = tokio::spawn(async move {
+            let _ = server.with_graceful_shutdown(async { let _ = rx.await; }).await;
+        });
+
+        let url = format!("http://{}:{}/", addr.ip(), addr.port());
+        std::env::set_var("JOB_WEBHOOK_URL", url.clone());
+        std::env::set_var("JOB_WEBHOOK_SECRET", "testsecret");
+        std::env::set_var("JOB_WEBHOOK_RETRIES", "5");
+
+        // call the helper that sends the webhook
+        send_webhook("test-id", "completed", Some(0), "out".to_string(), "".to_string(), chrono::Utc::now().timestamp_millis()).await;
+
+        // wait for server to observe at least 3 attempts
+        let start = tokio::time::Instant::now();
+        loop {
+            if counter.load(Ordering::SeqCst) >= 3 {
+                break;
+            }
+            if start.elapsed() > tokio::time::Duration::from_secs(20) {
+                panic!("webhook retries did not complete in time");
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        }
+
+        // shutdown server
+        let _ = tx.send(());
+        let _ = srv_handle.await;
     }
 }

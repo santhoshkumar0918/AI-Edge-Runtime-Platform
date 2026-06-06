@@ -1279,3 +1279,76 @@ Create:
 * deployment docs
 * failure analysis reports
 The deeper your engineering documentation becomes, the more valuable this project becomes.
+
+---
+
+## Webhook Verification Example
+
+If you configure `JOB_WEBHOOK_URL` and `JOB_WEBHOOK_SECRET`, the runtime signs each webhook payload with `X-Signature: sha256=<hex>`. Downstream consumers can verify the signature by hashing the exact raw request body with the shared secret.
+
+### Node.js
+
+```js
+import crypto from "crypto";
+import express from "express";
+
+const app = express();
+app.use(express.raw({ type: "application/json" }));
+
+app.post("/webhook", (req, res) => {
+	const signature = req.header("X-Signature") || "";
+	const secret = process.env.WEBHOOK_SECRET || "";
+	const expected = crypto
+		.createHmac("sha256", secret)
+		.update(req.body)
+		.digest("hex");
+
+	if (signature !== `sha256=${expected}`) {
+		return res.status(401).send("invalid signature");
+	}
+
+	const event = JSON.parse(req.body.toString("utf8"));
+	console.log("verified webhook:", event);
+	res.sendStatus(204);
+});
+
+app.listen(3000, () => console.log("listening on :3000"));
+```
+
+### Rust
+
+```rust
+use axum::{routing::post, http::HeaderMap, body::Bytes, response::IntoResponse, Router};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+
+async fn webhook(headers: HeaderMap, body: Bytes) -> impl IntoResponse {
+		let signature = headers
+				.get("X-Signature")
+				.and_then(|v| v.to_str().ok())
+				.unwrap_or("");
+		let secret = std::env::var("WEBHOOK_SECRET").unwrap_or_default();
+
+		let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("valid key");
+		mac.update(&body);
+		let expected = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+
+		if signature != expected {
+				return (axum::http::StatusCode::UNAUTHORIZED, "invalid signature");
+		}
+
+		let event: serde_json::Value = serde_json::from_slice(&body).unwrap();
+		println!("verified webhook: {event}");
+		(axum::http::StatusCode::NO_CONTENT, "")
+}
+
+fn app() -> Router {
+		Router::new().route("/webhook", post(webhook))
+}
+```
+
+Verification notes:
+
+* Compare against the raw request body, not a parsed JSON object.
+* Keep the shared secret out of the payload and headers.
+* Reject any request whose `X-Signature` does not match exactly.

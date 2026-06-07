@@ -88,6 +88,121 @@ async fn run_local_python(code: &str, dur: Duration) -> anyhow::Result<(String, 
     Err(anyhow::anyhow!("no python interpreter found"))
 }
 
+pub async fn run_python(code: &str, dur: Duration) -> anyhow::Result<(String, String, Option<i32>)> {
+    match run_container_python(code, dur).await {
+        Ok(result) => Ok(result),
+        Err(err) if cfg!(test) || std::env::var("EXECUTOR_LOCAL_FALLBACK").unwrap_or_default() == "1" => {
+            run_local_python(code, dur).await.map_err(|local_err| {
+                anyhow::anyhow!("container runner failed: {}; local fallback failed: {}", err, local_err)
+            })
+        }
+        Err(err) => Err(err),
+    }
+}
+
+pub async fn run_python_stream(id: String, code: &str, dur: Duration) -> anyhow::Result<()> {
+    let (tx, _rx) = broadcast::channel(100);
+    BROADCASTS.insert(id.clone(), tx.clone());
+
+    let script_path = write_code_to_tempfile_async(code).await?;
+    let config = sandbox_config();
+    let mut command = docker_command(&script_path, &config);
+    command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+
+    // prepare a slot to track the running child so we can cancel it from handlers
+    let running_slot = Arc::new(Mutex::new(None));
+    RUNNING_CHILDREN.insert(id.clone(), running_slot.clone());
+
+    let mut child = match command.spawn() {
+        Ok(child) => {
+            // place child into the running slot for cancellation
+            let mut guard = running_slot.lock().await;
+            *guard = Some(child);
+            // take it back for local control
+            guard.take().unwrap()
+        }
+        Err(e) => {
+            let err = format!("failed to start sandbox container: {}", e);
+            JOB_STORE.insert(
+                id.clone(),
+                Some(ExecutionResult {
+                    id: id.clone(),
+                    status: "failed".into(),
+                    stdout: "".into(),
+                    stderr: err.clone(),
+                    exit_code: None,
+                    created_at: Some(chrono::Utc::now().timestamp_millis()),
+                }),
+            );
+            let _ = tx.send(format!("ERR: {}", err));
+            BROADCASTS.remove(&id);
+            return Ok(());
+        }
+    };
+
+    let stdout_buffer = Arc::new(Mutex::new(String::new()));
+    let stderr_buffer = Arc::new(Mutex::new(String::new()));
+
+    let stdout_task = child.stdout.take().map(|stdout| {
+        let tx = tx.clone();
+        let buffer = Arc::clone(&stdout_buffer);
+        tokio::spawn(async move {
+            pump_stream_lines(BufReader::new(stdout).lines(), "OUT:", tx, buffer).await;
+        })
+    });
+
+    let stderr_task = child.stderr.take().map(|stderr| {
+        let tx = tx.clone();
+        let buffer = Arc::clone(&stderr_buffer);
+        tokio::spawn(async move {
+            pump_stream_lines(BufReader::new(stderr).lines(), "ERR:", tx, buffer).await;
+        })
+    });
+
+    match timeout(dur, child.wait()).await {
+        Ok(Ok(status)) => {
+            if let Some(task) = stdout_task {
+                let _ = task.await;
+            }
+            if let Some(task) = stderr_task {
+                let _ = task.await;
+            }
+
+            let stdout = stdout_buffer.lock().await.clone();
+            let stderr = stderr_buffer.lock().await.clone();
+            let status_text = if status.success() { "completed" } else { "failed" };
+            finalize_job(&id, &tx, status_text, stdout, stderr, status.code()).await;
+            // cleanup tempfile
+            cleanup_tempfile(&script_path).await;
+            Ok(())
+        }
+        Ok(Err(e)) => {
+            if let Some(task) = stdout_task {
+                let _ = task.await;
+            }
+            if let Some(task) = stderr_task {
+                let _ = task.await;
+            }
+            let err = format!("error: {}", e);
+            finalize_job(&id, &tx, "failed", String::new(), err, None).await;
+            cleanup_tempfile(&script_path).await;
+            Ok(())
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            if let Some(task) = stdout_task {
+                let _ = task.await;
+            }
+            if let Some(task) = stderr_task {
+                let _ = task.await;
+            }
+            finalize_job(&id, &tx, "failed", String::new(), "execution timed out".to_string(), None).await;
+            cleanup_tempfile(&script_path).await;
+            Ok(())
+        }
+    }
+}
+
 fn docker_command(script_path: &Path, config: &SandboxConfig) -> Command {
     let mut command = Command::new("docker");
     for arg in docker_command_args(script_path, config) {
@@ -185,8 +300,9 @@ async fn finalize_job(id: &str, tx: &broadcast::Sender<String>, status: &str, st
         let id = id.to_string();
         let stdout = stdout.clone();
         let stderr = stderr.clone();
+        let status_owned = status.to_string();
         tokio::spawn(async move {
-            let _ = send_webhook(&id, status, exit_code, stdout, stderr, now).await;
+            let _ = send_webhook(&id, &status_owned, exit_code, stdout, stderr, now).await;
         });
     }
 }

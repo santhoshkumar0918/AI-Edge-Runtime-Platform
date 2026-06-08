@@ -101,6 +101,7 @@ pub async fn run_python(code: &str, dur: Duration) -> anyhow::Result<(String, St
 }
 
 pub async fn run_python_stream(id: String, code: &str, dur: Duration) -> anyhow::Result<()> {
+    // create broadcast channel for logs and register it
     let (tx, _rx) = broadcast::channel(100);
     BROADCASTS.insert(id.clone(), tx.clone());
 
@@ -114,13 +115,7 @@ pub async fn run_python_stream(id: String, code: &str, dur: Duration) -> anyhow:
     RUNNING_CHILDREN.insert(id.clone(), running_slot.clone());
 
     let mut child = match command.spawn() {
-        Ok(child) => {
-            // place child into the running slot for cancellation
-            let mut guard = running_slot.lock().await;
-            *guard = Some(child);
-            // take it back for local control
-            guard.take().unwrap()
-        }
+        Ok(child) => child,
         Err(e) => {
             let err = format!("failed to start sandbox container: {}", e);
             JOB_STORE.insert(
@@ -136,71 +131,89 @@ pub async fn run_python_stream(id: String, code: &str, dur: Duration) -> anyhow:
             );
             let _ = tx.send(format!("ERR: {}", err));
             BROADCASTS.remove(&id);
+            RUNNING_CHILDREN.remove(&id);
             return Ok(());
         }
     };
 
+    // take stdout/stderr handles before moving the child into the shared slot
+    let stdout_handle = child.stdout.take();
+    let stderr_handle = child.stderr.take();
+
+    // place the child into the running slot so cancel can access it
+    {
+        let mut guard = running_slot.lock().await;
+        *guard = Some(child);
+    }
+
     let stdout_buffer = Arc::new(Mutex::new(String::new()));
     let stderr_buffer = Arc::new(Mutex::new(String::new()));
 
-    let stdout_task = child.stdout.take().map(|stdout| {
-        let tx = tx.clone();
-        let buffer = Arc::clone(&stdout_buffer);
-        tokio::spawn(async move {
-            pump_stream_lines(BufReader::new(stdout).lines(), "OUT:", tx, buffer).await;
-        })
-    });
-
-    let stderr_task = child.stderr.take().map(|stderr| {
-        let tx = tx.clone();
-        let buffer = Arc::clone(&stderr_buffer);
-        tokio::spawn(async move {
-            pump_stream_lines(BufReader::new(stderr).lines(), "ERR:", tx, buffer).await;
-        })
-    });
-
-    match timeout(dur, child.wait()).await {
-        Ok(Ok(status)) => {
-            if let Some(task) = stdout_task {
-                let _ = task.await;
-            }
-            if let Some(task) = stderr_task {
-                let _ = task.await;
-            }
-
-            let stdout = stdout_buffer.lock().await.clone();
-            let stderr = stderr_buffer.lock().await.clone();
-            let status_text = if status.success() { "completed" } else { "failed" };
-            finalize_job(&id, &tx, status_text, stdout, stderr, status.code()).await;
-            // cleanup tempfile
-            cleanup_tempfile(&script_path).await;
-            Ok(())
-        }
-        Ok(Err(e)) => {
-            if let Some(task) = stdout_task {
-                let _ = task.await;
-            }
-            if let Some(task) = stderr_task {
-                let _ = task.await;
-            }
-            let err = format!("error: {}", e);
-            finalize_job(&id, &tx, "failed", String::new(), err, None).await;
-            cleanup_tempfile(&script_path).await;
-            Ok(())
-        }
-        Err(_) => {
-            let _ = child.kill().await;
-            if let Some(task) = stdout_task {
-                let _ = task.await;
-            }
-            if let Some(task) = stderr_task {
-                let _ = task.await;
-            }
-            finalize_job(&id, &tx, "failed", String::new(), "execution timed out".to_string(), None).await;
-            cleanup_tempfile(&script_path).await;
-            Ok(())
-        }
+    // spawn readers for stdout/stderr if available
+    let mut reader_tasks = Vec::new();
+    if let Some(out) = stdout_handle {
+        let txc = tx.clone();
+        let buf = Arc::clone(&stdout_buffer);
+        reader_tasks.push(tokio::spawn(async move {
+            pump_stream_lines(BufReader::new(out).lines(), "OUT:", txc, buf).await;
+        }));
     }
+    if let Some(err) = stderr_handle {
+        let txc = tx.clone();
+        let buf = Arc::clone(&stderr_buffer);
+        reader_tasks.push(tokio::spawn(async move {
+            pump_stream_lines(BufReader::new(err).lines(), "ERR:", txc, buf).await;
+        }));
+    }
+
+    // spawn a waiter task that takes ownership of the child and awaits its exit
+    let id_clone = id.clone();
+    let wait_slot = running_slot.clone();
+    tokio::spawn(async move {
+        // take the child out of the slot for waiting
+        let mut child_opt = None;
+        {
+            let mut guard = wait_slot.lock().await;
+            child_opt = guard.take();
+        }
+
+        if let Some(mut child) = child_opt {
+            match timeout(dur, child.wait()).await {
+                Ok(Ok(status)) => {
+                    // wait for readers to finish
+                    for t in reader_tasks {
+                        let _ = t.await;
+                    }
+                    let stdout = stdout_buffer.lock().await.clone();
+                    let stderr = stderr_buffer.lock().await.clone();
+                    let status_text = if status.success() { "completed" } else { "failed" };
+                    finalize_job(&id_clone, &tx, status_text, stdout, stderr, status.code()).await;
+                }
+                Ok(Err(e)) => {
+                    for t in reader_tasks {
+                        let _ = t.await;
+                    }
+                    let err = format!("error: {}", e);
+                    finalize_job(&id_clone, &tx, "failed", String::new(), err, None).await;
+                }
+                Err(_) => {
+                    let _ = child.kill().await;
+                    for t in reader_tasks {
+                        let _ = t.await;
+                    }
+                    finalize_job(&id_clone, &tx, "failed", String::new(), "execution timed out".to_string(), None).await;
+                }
+            }
+        } else {
+            // no child available; finalize as failed
+            finalize_job(&id_clone, &tx, "failed", String::new(), "no child process".to_string(), None).await;
+        }
+
+        // cleanup tempfile
+        let _ = cleanup_tempfile(&script_path).await;
+    });
+
+    Ok(())
 }
 
 fn docker_command(script_path: &Path, config: &SandboxConfig) -> Command {
@@ -279,7 +292,6 @@ where
         let _ = tx.send(format!("{} {}", prefix, line));
     }
 }
-
 async fn finalize_job(id: &str, tx: &broadcast::Sender<String>, status: &str, stdout: String, stderr: String, exit_code: Option<i32>) {
     let now = chrono::Utc::now().timestamp_millis();
     let result = ExecutionResult {
@@ -294,6 +306,8 @@ async fn finalize_job(id: &str, tx: &broadcast::Sender<String>, status: &str, st
     crate::state::JOB_META.insert(id.to_string(), now);
     let _ = tx.send(format!("DONE: exit={:?}", exit_code));
     BROADCASTS.remove(id);
+    // ensure any running-child slot is removed to avoid leaks
+    crate::state::RUNNING_CHILDREN.remove(id);
 
     // delegate webhook delivery to background worker (non-blocking)
     if std::env::var("JOB_WEBHOOK_URL").is_ok() {
@@ -323,7 +337,11 @@ pub(crate) async fn send_webhook(id: &str, status: &str, exit_code: Option<i32>,
         let max_retries: u32 = std::env::var("JOB_WEBHOOK_RETRIES").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
         let secret = std::env::var("JOB_WEBHOOK_SECRET").ok();
 
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .user_agent("runtime-service-webhook/1.0")
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         let body_str = payload_clone.to_string();
 
         for attempt in 0..=max_retries {
@@ -339,9 +357,12 @@ pub(crate) async fn send_webhook(id: &str, status: &str, exit_code: Option<i32>,
             match req.send().await {
                 Ok(resp) => {
                     if resp.status().is_success() {
+                        tracing::info!(url = %url_clone, attempt, "webhook delivered");
                         return;
                     } else {
-                        tracing::warn!(attempt, url = %url_clone, status = %resp.status(), "webhook delivery non-success");
+                        let status = resp.status();
+                        let body = resp.text().await.unwrap_or_else(|_| "<body read error>".into());
+                        tracing::warn!(attempt, url = %url_clone, status = %status, body = %body, "webhook delivery non-success");
                     }
                 }
                 Err(e) => {
@@ -354,7 +375,8 @@ pub(crate) async fn send_webhook(id: &str, status: &str, exit_code: Option<i32>,
                 break;
             }
 
-            let backoff_secs = 2u64.pow(attempt.saturating_add(1));
+            // exponential backoff with cap
+            let backoff_secs = std::cmp::min(30, 2u64.pow((attempt + 1).min(6)));
             sleep(Duration::from_secs(backoff_secs)).await;
         }
     }

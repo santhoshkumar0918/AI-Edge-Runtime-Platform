@@ -171,11 +171,10 @@ pub async fn run_python_stream(id: String, code: &str, dur: Duration) -> anyhow:
     let wait_slot = running_slot.clone();
     tokio::spawn(async move {
         // take the child out of the slot for waiting
-        let mut child_opt = None;
-        {
+        let child_opt = {
             let mut guard = wait_slot.lock().await;
-            child_opt = guard.take();
-        }
+            guard.take()
+        };
 
         if let Some(mut child) = child_opt {
             match timeout(dur, child.wait()).await {

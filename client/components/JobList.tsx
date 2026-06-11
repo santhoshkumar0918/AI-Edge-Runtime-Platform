@@ -11,12 +11,14 @@ const baseUrl = process.env.NEXT_PUBLIC_RUNTIME_URL ?? process.env.RUNTIME_URL ?
 export default function JobList() {
   const [jobs, setJobs] = useState<Job[]>([]);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [logs, setLogs] = useState<Record<string, Logs>>({});
   const [apiKey, setApiKey] = useState<string>("");
   const [sortBy, setSortBy] = useState<"created" | "status" | "id">("created");
 
   async function loadJobs() {
     setLoading(true);
+    setError(null);
     try {
       const headers: Record<string,string> = {};
       const stored = localStorage.getItem("runtime_api_key") || apiKey;
@@ -25,6 +27,13 @@ export default function JobList() {
       }
       const res = await fetch(`${baseUrl}/jobs`, { cache: "no-store", headers });
       if (!res.ok) {
+        if (res.status === 401) {
+          setError("Unauthorized: invalid API key");
+        } else if (res.status === 403) {
+          setError("Forbidden: access denied");
+        } else {
+          setError(`Failed to load jobs (HTTP ${res.status})`);
+        }
         setJobs([]);
         return;
       }
@@ -32,6 +41,8 @@ export default function JobList() {
       const incoming: Job[] = (body.jobs || []).map((j: any) => ({ id: j.id, status: j.status, created_at: j.created_at ?? Date.now() }));
       setJobs(incoming);
     } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(`Connection error: ${msg}`);
       setJobs([]);
     } finally {
       setLoading(false);
@@ -45,15 +56,16 @@ export default function JobList() {
       if (stored) {
         headers["Authorization"] = `Bearer ${stored}`;
       }
-      const res = await fetch(`${baseUrl}/jobs/${id}/logs?tail=5`, { cache: "no-store", headers });
+      const res = await fetch(`${baseUrl}/jobs/${id}/logs?tail=10`, { cache: "no-store", headers });
       if (!res.ok) {
-        setLogs((s) => ({ ...s, [id]: { stdout: "", stderr: "failed to load" } }));
+        setLogs((s) => ({ ...s, [id]: { stdout: "", stderr: `Error: HTTP ${res.status}` } }));
         return;
       }
       const body = await res.json();
       setLogs((s) => ({ ...s, [id]: { stdout: body.stdout || "", stderr: body.stderr || "" } }));
     } catch (e) {
-      setLogs((s) => ({ ...s, [id]: { stdout: "", stderr: "error" } }));
+      const msg = e instanceof Error ? e.message : "error";
+      setLogs((s) => ({ ...s, [id]: { stdout: "", stderr: msg } }));
     }
   }
 
@@ -67,11 +79,14 @@ export default function JobList() {
       const res = await fetch(`${baseUrl}/jobs/${id}`, { method: "DELETE", headers });
       if (res.ok) {
         setJobs((s) => s.map((j) => (j.id === id ? { ...j, status: "cancelled" } : j)));
+        setError(null);
       } else {
-        console.error("failed to cancel", await res.text());
+        const text = await res.text();
+        setError(`Failed to cancel job: ${text}`);
       }
     } catch (e) {
-      console.error(e);
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(`Cancel error: ${msg}`);
     }
   }
 
@@ -80,6 +95,16 @@ export default function JobList() {
     const iv = setInterval(loadJobs, 5000);
     return () => clearInterval(iv);
   }, []);
+
+  const getStatusColor = (status: string) => {
+    switch (status) {
+      case "completed": return "bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-200";
+      case "failed": return "bg-red-100 dark:bg-red-900 text-red-800 dark:text-red-200";
+      case "cancelled": return "bg-yellow-100 dark:bg-yellow-900 text-yellow-800 dark:text-yellow-200";
+      case "running": return "bg-blue-100 dark:bg-blue-900 text-blue-800 dark:text-blue-200";
+      default: return "bg-zinc-100 dark:bg-zinc-800 text-zinc-800 dark:text-zinc-200";
+    }
+  };
 
   const sorted = [...jobs].sort((a,b) => {
     if (sortBy === "created") return (b.created_at || 0) - (a.created_at || 0);
@@ -90,6 +115,7 @@ export default function JobList() {
   return (
     <div className="mt-8">
       <h3 className="text-lg font-medium">Recent jobs</h3>
+      {error && <div className="mt-3 p-3 bg-red-50 border border-red-200 rounded text-red-700 text-sm">{error}</div>}
       <div className="mt-3 space-y-2">
         <div className="flex items-center gap-2">
           <input
@@ -115,36 +141,38 @@ export default function JobList() {
           </select>
         </div>
 
-        {loading && <div className="text-sm text-zinc-500">Loading...</div>}
+        {loading && <div className="text-sm text-zinc-500 animate-pulse">Loading jobs...</div>}
         {!loading && jobs.length === 0 && <div className="text-sm text-zinc-500">No jobs yet</div>}
         {sorted.map((j) => (
-          <div key={j.id} className="p-3 border rounded-md bg-white dark:bg-zinc-900 flex flex-col gap-2">
+          <div key={j.id} className="p-3 border rounded-md bg-white dark:bg-zinc-900 flex flex-col gap-2 hover:shadow-sm transition">
             <div className="flex items-center justify-between">
-              <div className="text-sm text-zinc-700 dark:text-zinc-200">{j.id}</div>
-              <div className="text-xs px-2 py-1 rounded-full bg-zinc-100 dark:bg-zinc-800">{j.status}</div>
+              <div className="text-sm font-mono text-zinc-700 dark:text-zinc-200 truncate">{j.id}</div>
+              <div className={`text-xs px-2 py-1 rounded-full font-medium ${getStatusColor(j.status)}`}>{j.status}</div>
             </div>
             <div className="text-xs text-zinc-500">Created: {new Date(j.created_at || Date.now()).toLocaleString()}</div>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
               <button
                 onClick={() => loadLogs(j.id)}
-                className="text-sm px-2 py-1 border rounded text-zinc-700 dark:text-zinc-200"
+                className="text-sm px-2 py-1 border rounded text-zinc-700 dark:text-zinc-200 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition"
               >
                 View logs
               </button>
-              <button
-                onClick={() => cancelJob(j.id)}
-                className="text-sm px-2 py-1 border rounded text-red-600"
-              >
-                Cancel
-              </button>
-              <a href={`${baseUrl}/status/${j.id}`} className="text-sm text-zinc-500 hover:underline">Status</a>
+              {j.status === "running" && (
+                <button
+                  onClick={() => cancelJob(j.id)}
+                  className="text-sm px-2 py-1 border border-red-300 rounded text-red-600 hover:bg-red-50 dark:hover:bg-red-900 transition"
+                >
+                  Cancel
+                </button>
+              )}
+              <a href={`${baseUrl}/status/${j.id}`} className="text-sm text-zinc-500 hover:underline">Details</a>
             </div>
             {logs[j.id] && (
-              <div className="mt-2 text-xs bg-zinc-50 dark:bg-zinc-950 p-2 rounded">
-                <div className="font-medium">Stdout</div>
-                <pre className="text-xs whitespace-pre-wrap">{logs[j.id]!.stdout || "(empty)"}</pre>
-                <div className="font-medium mt-2">Stderr</div>
-                <pre className="text-xs whitespace-pre-wrap">{logs[j.id]!.stderr || "(empty)"}</pre>
+              <div className="mt-2 text-xs bg-zinc-50 dark:bg-zinc-950 p-3 rounded border border-zinc-200 dark:border-zinc-800">
+                <div className="font-medium mb-1 text-zinc-700 dark:text-zinc-300">Stdout</div>
+                <pre className="text-xs whitespace-pre-wrap break-words max-h-24 overflow-y-auto">{logs[j.id]!.stdout || "(empty)"}</pre>
+                <div className="font-medium mt-2 mb-1 text-zinc-700 dark:text-zinc-300">Stderr</div>
+                <pre className="text-xs whitespace-pre-wrap break-words max-h-24 overflow-y-auto">{logs[j.id]!.stderr || "(empty)"}</pre>
               </div>
             )}
           </div>

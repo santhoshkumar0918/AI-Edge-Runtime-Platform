@@ -1,10 +1,10 @@
 use axum::{extract::Json, extract::Path, extract::Query, http::StatusCode, response::IntoResponse};
-use tokio::time::Duration;
-use tracing::{error, info};
+use tokio::time::{Duration, Instant};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::executor;
-use crate::state::JOB_STORE;
+use crate::state::{JOB_STORE, METRICS};
 use crate::types::{ExecutionRequest, ExecutionResult};
 use crate::state::BROADCASTS;
 use axum::extract::ws::{WebSocketUpgrade, WebSocket, Message};
@@ -13,6 +13,8 @@ use crate::state::RUNNING_CHILDREN;
 pub async fn execute_handler(Json(req): Json<ExecutionRequest>) -> impl IntoResponse {
     // synchronous/blocking execution (keeps previous behavior)
     let id = Uuid::new_v4().to_string();
+    let start = Instant::now();
+    METRICS.record_job_started();
     info!(id = %id, language = %req.language, "starting execution");
 
     // validation: non-empty, size limits
@@ -52,8 +54,10 @@ pub async fn execute_handler(Json(req): Json<ExecutionRequest>) -> impl IntoResp
         _ => Err(anyhow::anyhow!("unsupported language")),
     };
 
+    let elapsed_ms = start.elapsed().as_millis() as u64;
     match res {
         Ok((stdout, stderr, exit_code)) => {
+            METRICS.record_job_completed(elapsed_ms);
             let now = chrono::Utc::now().timestamp_millis();
             let body = ExecutionResult {
                 id: id.clone(),
@@ -65,10 +69,12 @@ pub async fn execute_handler(Json(req): Json<ExecutionRequest>) -> impl IntoResp
             };
             crate::state::JOB_META.insert(id.clone(), now);
             crate::state::JOB_STORE.insert(id.clone(), Some(body.clone()));
+            info!(id = %id, elapsed_ms = elapsed_ms, "execution completed successfully");
             (StatusCode::OK, Json(body))
         }
         Err(e) => {
-            error!(%e, "execution failed");
+            METRICS.record_job_failed();
+            error!(%e, id = %id, "execution failed");
             let now = chrono::Utc::now().timestamp_millis();
             let body = ExecutionResult {
                 id: id.clone(),
@@ -142,7 +148,7 @@ pub async fn status_handler(Path(id): Path<String>) -> impl IntoResponse {
         match entry.value() {
             None => {
                 let created = crate::state::JOB_META.get(&id).map(|v| *v.value());
-                (StatusCode::ACCEPTED, Json(serde_json::json!({"id": id, "status": "running", "created_at": created})))
+                (StatusCode::ACCEPTED, Json(serde_ json::json!({"id": id, "status": "running", "created_at": created})))
             }
             Some(res) => (StatusCode::OK, Json(serde_json::to_value(res.clone()).unwrap())),
         }
@@ -185,56 +191,57 @@ pub async fn cancel_job(Path(id): Path<String>) -> impl IntoResponse {
     if let Some(slot) = RUNNING_CHILDREN.get(&id) {
         let mut guard = slot.lock().await;
         if let Some(child) = guard.as_mut() {
-            let _ = child.kill().await;
+            match child.kill().await {
+                Ok(_) => info!(id = %id, "job cancelled successfully"),
+                Err(e) => warn!(id = %id, error = %e, "error killing job process"),
+            }
             *guard = None;
         }
+        METRICS.record_job_cancelled();
         let created_at = crate::state::JOB_META.get(&id).map(|v| *v.value());
         JOB_STORE.insert(id.clone(), Some(ExecutionResult { id: id.clone(), status: "cancelled".into(), stdout: "".into(), stderr: "cancelled by user".into(), exit_code: None, created_at }));
         RUNNING_CHILDREN.remove(&id);
-        return (StatusCode::OK, Json(serde_json::json!({"id": id, "status": "cancelled"}))); 
+        return (StatusCode::OK, Json(serde_json::json!({"id": id, "status": "cancelled"})));
     }
 
     (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not running"})))
 }
 
 pub async fn metrics() -> impl IntoResponse {
-    let total = JOB_STORE.len();
-    let running = JOB_STORE.iter().filter(|r| r.value().is_none()).count();
-    let completed = JOB_STORE.iter().filter(|r| r.value().is_some()).count();
-    // compute failures and last completed timestamp
-    let mut failures = 0usize;
-    let mut last_completed: Option<i64> = None;
-    let mut recent_ids: Vec<(String, i64)> = Vec::new();
-    for r in JOB_STORE.iter() {
-        if let Some(res) = r.value() {
-            if res.status == "failed" {
-                failures += 1;
-            }
-            if let Some(ts) = res.created_at {
-                last_completed = Some(last_completed.map_or(ts, |cur| std::cmp::max(cur, ts)));
-                recent_ids.push((r.key().clone(), ts));
-            }
-        } else {
-            // running jobs: include id
-            if let Some(ts) = crate::state::JOB_META.get(r.key()).map(|v| *v.value()) {
-                recent_ids.push((r.key().clone(), ts));
-            }
-        }
-    }
-    // sort recent ids by timestamp desc and take up to 20
-    recent_ids.sort_by(|a,b| b.1.cmp(&a.1));
-    let recent: Vec<String> = recent_ids.into_iter().take(20).map(|(id, _)| id).collect();
-    // collect running ids
-    let running_ids: Vec<String> = JOB_STORE.iter().filter(|r| r.value().is_none()).map(|r| r.key().clone()).collect();
-
+    let snapshot = METRICS.snapshot();
+    let avg_execution_time_ms = if snapshot.completed_jobs > 0 {
+        snapshot.total_execution_time_ms / snapshot.completed_jobs
+    } else {
+        0
+    };
+    let success_rate = if snapshot.total_jobs > 0 {
+        (snapshot.completed_jobs as f64 / snapshot.total_jobs as f64 * 100.0) as u64
+    } else {
+        0
+    };
+    let webhook_success_rate = if snapshot.webhook_delivered + snapshot.webhook_failed > 0 {
+        (snapshot.webhook_delivered as f64 / (snapshot.webhook_delivered + snapshot.webhook_failed) as f64 * 100.0) as u64
+    } else {
+        0
+    };
     let resp = serde_json::json!({
-        "total": total,
-        "running": running,
-        "completed": completed,
-        "failures": failures,
-        "last_completed_at": last_completed,
-        "running_job_ids": running_ids,
-        "recent_job_ids": recent,
+        "total_jobs": snapshot.total_jobs,
+        "completed_jobs": snapshot.completed_jobs,
+        "failed_jobs": snapshot.failed_jobs,
+        "running_jobs": snapshot.running_jobs,
+        "cancelled_jobs": snapshot.cancelled_jobs,
+        "success_rate_pct": success_rate,
+        "execution_time": {
+            "total_ms": snapshot.total_execution_time_ms,
+            "min_ms": if snapshot.min_execution_time_ms == u64::MAX { 0 } else { snapshot.min_execution_time_ms },
+            "max_ms": snapshot.max_execution_time_ms,
+            "avg_ms": avg_execution_time_ms,
+        },
+        "webhooks": {
+            "delivered": snapshot.webhook_delivered,
+            "failed": snapshot.webhook_failed,
+            "success_rate_pct": webhook_success_rate,
+        },
     });
     (StatusCode::OK, Json(resp))
 }

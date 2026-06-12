@@ -7,10 +7,10 @@ use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command,
     sync::{broadcast, Mutex},
-    time::{timeout, Duration, sleep},
+    time::{timeout, Duration, Instant, sleep},
 };
 use crate::{
-    state::{BROADCASTS, JOB_STORE, RUNNING_CHILDREN},
+    state::{BROADCASTS, JOB_STORE, METRICS, RUNNING_CHILDREN},
     types::ExecutionResult,
 };
 
@@ -101,6 +101,7 @@ pub async fn run_python(code: &str, dur: Duration) -> anyhow::Result<(String, St
 }
 
 pub async fn run_python_stream(id: String, code: &str, dur: Duration) -> anyhow::Result<()> {
+    let started_at = Instant::now();
     // create broadcast channel for logs and register it
     let (tx, _rx) = broadcast::channel(100);
     BROADCASTS.insert(id.clone(), tx.clone());
@@ -186,6 +187,12 @@ pub async fn run_python_stream(id: String, code: &str, dur: Duration) -> anyhow:
                     let stdout = stdout_buffer.lock().await.clone();
                     let stderr = stderr_buffer.lock().await.clone();
                     let status_text = if status.success() { "completed" } else { "failed" };
+                    let elapsed_ms = started_at.elapsed().as_millis() as u64;
+                    if status.success() {
+                        METRICS.record_job_completed(elapsed_ms);
+                    } else {
+                        METRICS.record_job_failed();
+                    }
                     finalize_job(&id_clone, &tx, status_text, stdout, stderr, status.code()).await;
                 }
                 Ok(Err(e)) => {
@@ -193,6 +200,7 @@ pub async fn run_python_stream(id: String, code: &str, dur: Duration) -> anyhow:
                         let _ = t.await;
                     }
                     let err = format!("error: {}", e);
+                    METRICS.record_job_failed();
                     finalize_job(&id_clone, &tx, "failed", String::new(), err, None).await;
                 }
                 Err(_) => {
@@ -200,11 +208,13 @@ pub async fn run_python_stream(id: String, code: &str, dur: Duration) -> anyhow:
                     for t in reader_tasks {
                         let _ = t.await;
                     }
+                    METRICS.record_job_failed();
                     finalize_job(&id_clone, &tx, "failed", String::new(), "execution timed out".to_string(), None).await;
                 }
             }
         } else {
             // no child available; finalize as failed
+            METRICS.record_job_failed();
             finalize_job(&id_clone, &tx, "failed", String::new(), "no child process".to_string(), None).await;
         }
 
@@ -356,6 +366,7 @@ pub(crate) async fn send_webhook(id: &str, status: &str, exit_code: Option<i32>,
             match req.send().await {
                 Ok(resp) => {
                     if resp.status().is_success() {
+                        METRICS.record_webhook_success();
                         tracing::info!(url = %url_clone, attempt, "webhook delivered");
                         return;
                     } else {
@@ -370,6 +381,7 @@ pub(crate) async fn send_webhook(id: &str, status: &str, exit_code: Option<i32>,
             }
 
             if attempt == max_retries {
+                METRICS.record_webhook_failure();
                 tracing::error!(url = %url_clone, "webhook delivery failed after retries");
                 break;
             }

@@ -45,12 +45,16 @@ impl Metrics {
     }
 
     pub fn snapshot(&self) -> MetricsSnapshot {
+        let total = self.total_jobs.load(Ordering::Relaxed);
+        let completed = self.completed_jobs.load(Ordering::Relaxed);
+        let failed = self.failed_jobs.load(Ordering::Relaxed);
+        let cancelled = self.cancelled_jobs.load(Ordering::Relaxed);
         MetricsSnapshot {
-            total_jobs: self.total_jobs.load(Ordering::Relaxed),
-            completed_jobs: self.completed_jobs.load(Ordering::Relaxed),
-            failed_jobs: self.failed_jobs.load(Ordering::Relaxed),
-            running_jobs: self.total_jobs.load(Ordering::Relaxed) - (self.completed_jobs.load(Ordering::Relaxed) + self.failed_jobs.load(Ordering::Relaxed) + self.cancelled_jobs.load(Ordering::Relaxed)),
-            cancelled_jobs: self.cancelled_jobs.load(Ordering::Relaxed),
+            total_jobs: total,
+            completed_jobs: completed,
+            failed_jobs: failed,
+            running_jobs: total.saturating_sub(completed.saturating_add(failed).saturating_add(cancelled)),
+            cancelled_jobs: cancelled,
             total_execution_time_ms: self.total_execution_time_ms.load(Ordering::Relaxed),
             min_execution_time_ms: self.min_execution_time_ms.load(Ordering::Relaxed),
             max_execution_time_ms: self.max_execution_time_ms.load(Ordering::Relaxed),

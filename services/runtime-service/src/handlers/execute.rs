@@ -10,49 +10,97 @@ use crate::state::BROADCASTS;
 use axum::extract::ws::{WebSocketUpgrade, WebSocket, Message};
 use crate::state::RUNNING_CHILDREN;
 
+fn max_code_bytes() -> usize {
+    std::env::var("MAX_CODE_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10_000)
+}
+
+fn max_timeout_ms() -> u64 {
+    std::env::var("MAX_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30_000)
+}
+
+fn max_concurrent_jobs() -> usize {
+    std::env::var("MAX_CONCURRENT_JOBS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(128)
+}
+
+fn running_jobs_count() -> usize {
+    JOB_STORE.iter().filter(|r| r.value().is_none()).count()
+}
+
+fn validate_execution_request(req: &ExecutionRequest) -> Result<u64, String> {
+    if req.code.trim().is_empty() {
+        return Err("empty code".to_string());
+    }
+
+    let max_code = max_code_bytes();
+    if req.code.len() > max_code {
+        return Err(format!("code too large (max {} bytes)", max_code));
+    }
+
+    if req.language != "python" && req.language != "py" {
+        return Err("unsupported language".to_string());
+    }
+
+    let max_timeout = max_timeout_ms();
+    let requested = req.timeout_ms.unwrap_or(5_000);
+    if requested == 0 || requested > max_timeout {
+        return Err(format!("invalid timeout; must be 1..{} ms", max_timeout));
+    }
+
+    Ok(requested)
+}
+
+fn failed_body(id: &str, message: String) -> ExecutionResult {
+    let now = chrono::Utc::now().timestamp_millis();
+    ExecutionResult {
+        id: id.to_string(),
+        status: "failed".into(),
+        stdout: "".into(),
+        stderr: message,
+        exit_code: None,
+        created_at: Some(now),
+    }
+}
+
 pub async fn execute_handler(Json(req): Json<ExecutionRequest>) -> impl IntoResponse {
     // synchronous/blocking execution (keeps previous behavior)
     let id = Uuid::new_v4().to_string();
-    let start = Instant::now();
-    METRICS.record_job_started();
     info!(id = %id, language = %req.language, "starting execution");
 
-    // validation: non-empty, size limits
-    if req.code.trim().is_empty() {
-        let now = chrono::Utc::now().timestamp_millis();
-        let body = ExecutionResult { id: id.clone(), status: "failed".into(), stdout: "".into(), stderr: "empty code".into(), exit_code: None, created_at: Some(now) };
-        crate::state::JOB_META.insert(id.clone(), now);
-        crate::state::JOB_STORE.insert(id.clone(), Some(body.clone()));
-        return (StatusCode::BAD_REQUEST, Json(body));
+    let requested = match validate_execution_request(&req) {
+        Ok(timeout_ms) => timeout_ms,
+        Err(msg) => {
+            let body = failed_body(&id, msg);
+            if let Some(created_at) = body.created_at {
+                crate::state::JOB_META.insert(id.clone(), created_at);
+            }
+            JOB_STORE.insert(id.clone(), Some(body.clone()));
+            return (StatusCode::BAD_REQUEST, Json(body));
+        }
+    };
+
+    if running_jobs_count() >= max_concurrent_jobs() {
+        let body = failed_body(&id, "too many running jobs".to_string());
+        if let Some(created_at) = body.created_at {
+            crate::state::JOB_META.insert(id.clone(), created_at);
+        }
+        JOB_STORE.insert(id.clone(), Some(body.clone()));
+        return (StatusCode::TOO_MANY_REQUESTS, Json(body));
     }
 
-    let max_code: usize = std::env::var("MAX_CODE_BYTES").ok().and_then(|s| s.parse().ok()).unwrap_or(10_000);
-    if req.code.len() > max_code {
-        let now = chrono::Utc::now().timestamp_millis();
-        let body = ExecutionResult { id: id.clone(), status: "failed".into(), stdout: "".into(), stderr: "code too large".into(), exit_code: None, created_at: Some(now) };
-        crate::state::JOB_META.insert(id.clone(), now);
-        crate::state::JOB_STORE.insert(id.clone(), Some(body.clone()));
-        return (StatusCode::BAD_REQUEST, Json(body));
-    }
-
-    // validate timeout
-    let max_timeout_ms: u64 = std::env::var("MAX_TIMEOUT_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(30_000);
-    let requested = req.timeout_ms.unwrap_or(5_000) as u64;
-    if requested == 0 || requested > max_timeout_ms {
-        let now = chrono::Utc::now().timestamp_millis();
-        let body = ExecutionResult { id: id.clone(), status: "failed".into(), stdout: "".into(), stderr: format!("invalid timeout; must be 1..{} ms", max_timeout_ms), exit_code: None, created_at: Some(now) };
-        crate::state::JOB_META.insert(id.clone(), now);
-        crate::state::JOB_STORE.insert(id.clone(), Some(body.clone()));
-        return (StatusCode::BAD_REQUEST, Json(body));
-    }
-
+    let start = Instant::now();
+    METRICS.record_job_started();
     let timeout_dur = Duration::from_millis(requested);
 
-    // dispatch to executor
-    let res = match req.language.as_str() {
-        "python" | "py" => executor::run_python(&req.code, timeout_dur).await,
-        _ => Err(anyhow::anyhow!("unsupported language")),
-    };
+    let res = executor::run_python(&req.code, timeout_dur).await;
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
     match res {
@@ -95,26 +143,18 @@ pub async fn execute_async_handler(Json(req): Json<ExecutionRequest>) -> impl In
     let id = Uuid::new_v4().to_string();
     info!(id = %id, language = %req.language, "scheduling async execution");
 
-    // basic validation
-    if req.code.trim().is_empty() {
-        let body = serde_json::json!({"error": "empty code"});
-        return (StatusCode::BAD_REQUEST, Json(body));
-    }
-    let max_code: usize = std::env::var("MAX_CODE_BYTES").ok().and_then(|s| s.parse().ok()).unwrap_or(10_000);
-    if req.code.len() > max_code {
-        let body = serde_json::json!({"error": "code too large"});
-        return (StatusCode::BAD_REQUEST, Json(body));
-    }
+    let requested = match validate_execution_request(&req) {
+        Ok(timeout_ms) => timeout_ms,
+        Err(msg) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": msg}))),
+    };
 
-    let max_timeout_ms: u64 = std::env::var("MAX_TIMEOUT_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(30_000);
-    let requested = req.timeout_ms.unwrap_or(5_000) as u64;
-    if requested == 0 || requested > max_timeout_ms {
-        let body = serde_json::json!({"error": format!("invalid timeout; must be 1..{} ms", max_timeout_ms)});
-        return (StatusCode::BAD_REQUEST, Json(body));
+    if running_jobs_count() >= max_concurrent_jobs() {
+        return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({"error": "too many running jobs"})));
     }
 
     // mark as running
     JOB_STORE.insert(id.clone(), None);
+    METRICS.record_job_started();
     let now = chrono::Utc::now().timestamp_millis();
     crate::state::JOB_META.insert(id.clone(), now);
 
@@ -124,16 +164,20 @@ pub async fn execute_async_handler(Json(req): Json<ExecutionRequest>) -> impl In
     let id_clone = id.clone();
 
     tokio::spawn(async move {
-        match lang.as_str() {
-            "python" | "py" => {
-                let _ = executor::run_python_stream(id_clone.clone(), &code, timeout_dur).await;
-            }
-            _ => {
-                let now = chrono::Utc::now().timestamp_millis();
-                let body = ExecutionResult { id: id_clone.clone(), status: "failed".into(), stdout: "".into(), stderr: "unsupported language".into(), exit_code: None, created_at: Some(now) };
-                crate::state::JOB_META.insert(id_clone.clone(), now);
-                JOB_STORE.insert(id_clone, Some(body));
-            }
+        let _ = lang; // language already validated
+        if let Err(err) = executor::run_python_stream(id_clone.clone(), &code, timeout_dur).await {
+            METRICS.record_job_failed();
+            let now = chrono::Utc::now().timestamp_millis();
+            let body = ExecutionResult {
+                id: id_clone.clone(),
+                status: "failed".into(),
+                stdout: "".into(),
+                stderr: format!("execution task failed: {}", err),
+                exit_code: None,
+                created_at: Some(now),
+            };
+            crate::state::JOB_META.insert(id_clone.clone(), now);
+            JOB_STORE.insert(id_clone, Some(body));
         }
     });
 
@@ -148,7 +192,7 @@ pub async fn status_handler(Path(id): Path<String>) -> impl IntoResponse {
         match entry.value() {
             None => {
                 let created = crate::state::JOB_META.get(&id).map(|v| *v.value());
-                (StatusCode::ACCEPTED, Json(serde_ json::json!({"id": id, "status": "running", "created_at": created})))
+                (StatusCode::ACCEPTED, Json(serde_json::json!({"id": id, "status": "running", "created_at": created})))
             }
             Some(res) => (StatusCode::OK, Json(serde_json::to_value(res.clone()).unwrap())),
         }
@@ -305,6 +349,7 @@ pub async fn purge_jobs() -> impl IntoResponse {
         }
     }
     JOB_STORE.clear();
+    crate::state::JOB_META.clear();
     BROADCASTS.clear();
     RUNNING_CHILDREN.clear();
     (StatusCode::OK, Json(serde_json::json!({"status": "purged"})))

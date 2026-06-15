@@ -18,6 +18,8 @@ export default function JobList() {
   const [code, setCode] = useState<string>("print('hello from runtime')\n");
   const [language, setLanguage] = useState<string>("python");
   const [timeoutMs, setTimeoutMs] = useState<number>(5000);
+  const [wsStates, setWsStates] = useState<Record<string, "connecting" | "open" | "closed" | "error">>({});
+  const [results, setResults] = useState<Record<string, { exit_code?: number | null; status?: string }>>({});
 
   async function loadJobs() {
     setLoading(true);
@@ -126,8 +128,22 @@ export default function JobList() {
       setLogs((s) => ({ ...s, [id]: { stdout: '', stderr: '' } }));
 
       // open websocket to stream logs
+      setWsStates((s) => ({ ...s, [id]: 'connecting' }));
       const sock = wsForId(id);
-      if (!sock) return;
+      if (!sock) {
+        setWsStates((s) => ({ ...s, [id]: 'error' }));
+        return;
+      }
+      sock.onopen = () => {
+        setWsStates((s) => ({ ...s, [id]: 'open' }));
+      };
+      sock.onclose = () => {
+        setWsStates((s) => ({ ...s, [id]: 'closed' }));
+      };
+      sock.onerror = () => {
+        setWsStates((s) => ({ ...s, [id]: 'error' }));
+      };
+
       sock.onmessage = (ev) => {
         const msg = ev.data as string;
         if (msg.startsWith('OUT:')) {
@@ -139,14 +155,47 @@ export default function JobList() {
         } else if (msg.startsWith('DONE:')) {
           // finalization message — mark job completed
           setJobs((s) => s.map((t) => (t.id === id ? { ...t, status: 'completed' } : t)));
-          sock.close();
+          // try to parse exit code from message like: "DONE: exit=Some(0)" or "DONE: exit=None"
+          const m = msg.match(/exit=\s*(.*)$/);
+          let exit_code: number | null | undefined = undefined;
+          if (m && m[1]) {
+            const digits = m[1].match(/-?\\d+/);
+            if (digits) {
+              exit_code = Number(digits[0]);
+            } else {
+              exit_code = null;
+            }
+          }
+          setResults((s) => ({ ...s, [id]: { exit_code, status: 'completed' } }));
+          // fetch final logs/result from the API to ensure full output
+          (async () => {
+            try {
+              const headers: Record<string,string> = {};
+              const stored = localStorage.getItem("runtime_api_key") || apiKey;
+              if (stored) headers["Authorization"] = `Bearer ${stored}`;
+              const r = await fetch(`${baseUrl}/status/${id}`, { cache: 'no-store', headers });
+              if (r.ok) {
+                const body = await r.json();
+                if (body && typeof body === 'object') {
+                  setResults((s) => ({ ...s, [id]: { exit_code: body.exit_code ?? exit_code, status: body.status } }));
+                }
+              }
+              const logsRes = await fetch(`${baseUrl}/jobs/${id}/logs?tail=0`, { cache: 'no-store', headers });
+              if (logsRes.ok) {
+                const logsBody = await logsRes.json();
+                setLogs((s) => ({ ...s, [id]: { stdout: logsBody.stdout || '', stderr: logsBody.stderr || '' } }));
+              }
+            } catch (e) {
+              // ignore
+            } finally {
+              try { sock.close(); } catch (_) {}
+              setWsStates((s) => ({ ...s, [id]: 'closed' }));
+            }
+          })();
         } else {
           // generic text
           setLogs((s) => ({ ...s, [id]: { stdout: (s[id]?.stdout || '') + msg + '\n', stderr: s[id]?.stderr || '' } }));
         }
-      };
-      sock.onerror = (e) => {
-        setError('WebSocket error connecting to log stream');
       };
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -226,7 +275,14 @@ export default function JobList() {
           <div key={j.id} className="p-3 border rounded-md bg-white dark:bg-zinc-900 flex flex-col gap-2 hover:shadow-sm transition">
             <div className="flex items-center justify-between">
               <div className="text-sm font-mono text-zinc-700 dark:text-zinc-200 truncate">{j.id}</div>
-              <div className={`text-xs px-2 py-1 rounded-full font-medium ${getStatusColor(j.status)}`}>{j.status}</div>
+              <div className="flex items-center gap-2">
+                <div className={`text-xs px-2 py-1 rounded-full font-medium ${getStatusColor(j.status)}`}>{j.status}</div>
+                {wsStates[j.id] && j.status === 'running' && (
+                  <div className={`text-xs px-2 py-1 rounded-full font-medium ${wsStates[j.id] === 'open' ? 'bg-emerald-100 text-emerald-700' : wsStates[j.id] === 'connecting' ? 'bg-amber-100 text-amber-700' : 'bg-zinc-100 text-zinc-700'}`}>
+                    {wsStates[j.id]}
+                  </div>
+                )}
+              </div>
             </div>
             <div className="text-xs text-zinc-500">Created: {new Date(j.created_at || Date.now()).toLocaleString()}</div>
             <div className="flex items-center gap-2 flex-wrap">
@@ -252,6 +308,13 @@ export default function JobList() {
                 <pre className="text-xs whitespace-pre-wrap break-words max-h-24 overflow-y-auto">{logs[j.id]!.stdout || "(empty)"}</pre>
                 <div className="font-medium mt-2 mb-1 text-zinc-700 dark:text-zinc-300">Stderr</div>
                 <pre className="text-xs whitespace-pre-wrap break-words max-h-24 overflow-y-auto">{logs[j.id]!.stderr || "(empty)"}</pre>
+              </div>
+            )}
+            {results[j.id] && (
+              <div className="mt-2 text-sm rounded p-3 border border-zinc-200 bg-zinc-50 dark:bg-zinc-950 dark:border-zinc-800">
+                <div className="font-medium text-zinc-700 dark:text-zinc-300">Result</div>
+                <div className="text-xs text-zinc-600 dark:text-zinc-400 mt-1">Status: {results[j.id].status}</div>
+                <div className="text-xs text-zinc-600 dark:text-zinc-400">Exit code: {results[j.id].exit_code ?? 'N/A'}</div>
               </div>
             )}
           </div>

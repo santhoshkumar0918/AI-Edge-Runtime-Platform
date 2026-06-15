@@ -15,6 +15,9 @@ export default function JobList() {
   const [logs, setLogs] = useState<Record<string, Logs>>({});
   const [apiKey, setApiKey] = useState<string>("");
   const [sortBy, setSortBy] = useState<"created" | "status" | "id">("created");
+  const [code, setCode] = useState<string>("print('hello from runtime')\n");
+  const [language, setLanguage] = useState<string>("python");
+  const [timeoutMs, setTimeoutMs] = useState<number>(5000);
 
   async function loadJobs() {
     setLoading(true);
@@ -90,6 +93,67 @@ export default function JobList() {
     }
   }
 
+  function wsForId(id: string): WebSocket | null {
+    try {
+      const full = `${baseUrl}/ws/${id}`;
+      const u = new URL(full);
+      u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
+      return new WebSocket(u.toString());
+    } catch (e) {
+      return null;
+    }
+  }
+
+  async function submitCode() {
+    setError(null);
+    try {
+      const headers: Record<string,string> = { 'Content-Type': 'application/json' };
+      const stored = localStorage.getItem("runtime_api_key") || apiKey;
+      if (stored) headers["Authorization"] = `Bearer ${stored}`;
+
+      const body = { language: language, code: code, timeout_ms: timeoutMs };
+      const res = await fetch(`${baseUrl}/execute_async`, { method: 'POST', headers, body: JSON.stringify(body) });
+      if (!res.ok) {
+        const txt = await res.text();
+        setError(`Failed to schedule: HTTP ${res.status} ${txt}`);
+        return;
+      }
+      const j = await res.json();
+      const id = j.id as string;
+
+      // optimistically add job
+      setJobs((s) => [{ id, status: 'running', created_at: Date.now() }, ...s]);
+      setLogs((s) => ({ ...s, [id]: { stdout: '', stderr: '' } }));
+
+      // open websocket to stream logs
+      const sock = wsForId(id);
+      if (!sock) return;
+      sock.onmessage = (ev) => {
+        const msg = ev.data as string;
+        if (msg.startsWith('OUT:')) {
+          const line = msg.slice(4).trim();
+          setLogs((s) => ({ ...s, [id]: { stdout: (s[id]?.stdout || '') + line + '\n', stderr: s[id]?.stderr || '' } }));
+        } else if (msg.startsWith('ERR:')) {
+          const line = msg.slice(4).trim();
+          setLogs((s) => ({ ...s, [id]: { stdout: s[id]?.stdout || '', stderr: (s[id]?.stderr || '') + line + '\n' } }));
+        } else if (msg.startsWith('DONE:')) {
+          // finalization message — mark job completed
+          setJobs((s) => s.map((t) => (t.id === id ? { ...t, status: 'completed' } : t)));
+          sock.close();
+        } else {
+          // generic text
+          setLogs((s) => ({ ...s, [id]: { stdout: (s[id]?.stdout || '') + msg + '\n', stderr: s[id]?.stderr || '' } }));
+        }
+      };
+      sock.onerror = (e) => {
+        setError('WebSocket error connecting to log stream');
+      };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(`Submit error: ${msg}`);
+    }
+  }
+
   useEffect(() => {
     loadJobs();
     const iv = setInterval(loadJobs, 5000);
@@ -115,6 +179,21 @@ export default function JobList() {
   return (
     <div className="mt-8">
       <h3 className="text-lg font-medium">Recent jobs</h3>
+      <div className="mt-4 p-3 border rounded-md bg-white dark:bg-zinc-900">
+        <div className="flex flex-col gap-2">
+          <label className="text-sm font-medium">Code</label>
+          <textarea value={code} onChange={(e) => setCode(e.target.value)} className="w-full h-28 p-2 border rounded text-sm font-mono bg-zinc-50 dark:bg-zinc-950" />
+          <div className="flex items-center gap-2">
+            <label className="text-sm">Language</label>
+            <select value={language} onChange={(e) => setLanguage(e.target.value)} className="px-2 py-1 border rounded text-sm">
+              <option value="python">python</option>
+            </select>
+            <label className="text-sm">Timeout (ms)</label>
+            <input type="number" value={timeoutMs} onChange={(e) => setTimeoutMs(Number(e.target.value))} className="px-2 py-1 border rounded text-sm w-28" />
+            <button onClick={submitCode} className="ml-auto text-sm px-3 py-1 bg-zinc-900 text-white rounded">Run</button>
+          </div>
+        </div>
+      </div>
       {error && <div className="mt-3 p-3 bg-red-50 border border-red-200 rounded text-red-700 text-sm">{error}</div>}
       <div className="mt-3 space-y-2">
         <div className="flex items-center gap-2">

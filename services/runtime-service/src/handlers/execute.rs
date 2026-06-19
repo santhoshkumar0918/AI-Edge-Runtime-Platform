@@ -429,4 +429,37 @@ mod tests {
             break;
         }
     }
+
+    #[tokio::test]
+    async fn test_execute_js_sync() {
+        let req = ExecutionRequest {
+            language: "javascript".into(),
+            code: "console.log('js-sync-test')".into(),
+            timeout_ms: Some(2000),
+        };
+
+        let resp = execute_handler(Json(req)).await.into_response();
+        let status = resp.status();
+        if status == StatusCode::OK {
+            let body_bytes = body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+            let v: ExecutionResult = serde_json::from_slice(&body_bytes).unwrap();
+            assert!(v.stdout.contains("js-sync-test"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_bash_sync() {
+        let req = ExecutionRequest {
+            language: "bash".into(),
+            code: "echo 'bash-sync-test'".into(),
+            timeout_ms: Some(2000),
+        };
+
+        let resp = execute_handler(Json(req)).await.into_response();
+        let status = resp.status();
+        assert_eq!(status, StatusCode::OK);
+        let body_bytes = body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let v: ExecutionResult = serde_json::from_slice(&body_bytes).unwrap();
+        assert!(v.stdout.contains("bash-sync-test"));
+    }
 }

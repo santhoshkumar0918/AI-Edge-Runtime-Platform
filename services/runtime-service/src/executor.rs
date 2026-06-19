@@ -20,13 +20,10 @@ use sha2::Sha256;
 use hex;
 use reqwest;
 
-const DEFAULT_CONTAINER_IMAGE: &str = "python:3.12-slim";
 const SANDBOX_DIR: &str = "/sandbox";
-const SANDBOX_SCRIPT_PATH: &str = "/sandbox/main.py";
 
 #[derive(Debug, Clone)]
 struct SandboxConfig {
-    image: String,
     memory_mb: u64,
     cpus: String,
     pids_limit: u64,
@@ -35,7 +32,6 @@ struct SandboxConfig {
 impl SandboxConfig {
     fn from_env() -> Self {
         Self {
-            image: std::env::var("EXECUTOR_IMAGE").unwrap_or_else(|_| DEFAULT_CONTAINER_IMAGE.to_string()),
             memory_mb: std::env::var("EXECUTOR_MEMORY_MB").ok().and_then(|value| value.parse().ok()).unwrap_or(256),
             cpus: std::env::var("EXECUTOR_CPUS").unwrap_or_else(|_| "1.0".to_string()),
             pids_limit: std::env::var("EXECUTOR_PIDS_LIMIT").ok().and_then(|value| value.parse().ok()).unwrap_or(64),
@@ -47,9 +43,49 @@ fn sandbox_config() -> SandboxConfig {
     SandboxConfig::from_env()
 }
 
-async fn write_code_to_tempfile_async(code: &str) -> anyhow::Result<PathBuf> {
+#[derive(Debug, Clone)]
+struct LangConfig {
+    extension: &'static str,
+    default_image: &'static str,
+    docker_cmd: Vec<String>,
+    local_cmds: Vec<Vec<String>>,
+}
+
+fn get_lang_config(lang: &str) -> Option<LangConfig> {
+    match lang.to_lowercase().as_str() {
+        "python" | "py" => Some(LangConfig {
+            extension: "py",
+            default_image: "python:3.12-slim",
+            docker_cmd: vec!["python".into(), "-u".into(), "/sandbox/main.py".into()],
+            local_cmds: vec![
+                vec!["python3".into()],
+                vec!["python".into()],
+            ],
+        }),
+        "javascript" | "js" => Some(LangConfig {
+            extension: "js",
+            default_image: "node:20-slim",
+            docker_cmd: vec!["node".into(), "/sandbox/main.js".into()],
+            local_cmds: vec![
+                vec!["node".into()],
+            ],
+        }),
+        "bash" | "sh" => Some(LangConfig {
+            extension: "sh",
+            default_image: "ubuntu:latest",
+            docker_cmd: vec!["bash".into(), "/sandbox/main.sh".into()],
+            local_cmds: vec![
+                vec!["bash".into()],
+                vec!["sh".into()],
+            ],
+        }),
+        _ => None,
+    }
+}
+
+async fn write_code_to_tempfile_async(code: &str, extension: &str) -> anyhow::Result<PathBuf> {
     let dir = std::env::var("EXECUTOR_TMP_DIR").unwrap_or_else(|_| "/tmp".to_string());
-    let name = format!("runtime-{}.py", Uuid::new_v4());
+    let name = format!("runtime-{}.{}", Uuid::new_v4(), extension);
     let path = PathBuf::from(format!("{}/{}", dir.trim_end_matches('/'), name));
     fs::write(&path, code.as_bytes()).await.context("failed to write sandbox source file")?;
     Ok(path)
@@ -67,10 +103,15 @@ async fn run_command_output(mut command: Command, dur: Duration) -> anyhow::Resu
     }
 }
 
-async fn run_local_python(code: &str, dur: Duration) -> anyhow::Result<(String, String, Option<i32>)> {
-    for program in ["python3", "python"] {
-        let mut command = Command::new(program);
-        command.arg("-u").arg("-c").arg(code);
+async fn run_local_code(lang_cfg: &LangConfig, script_path: &Path, dur: Duration) -> anyhow::Result<(String, String, Option<i32>)> {
+    for cmd_parts in &lang_cfg.local_cmds {
+        let binary = &cmd_parts[0];
+        let mut command = Command::new(binary);
+        for arg in &cmd_parts[1..] {
+            command.arg(arg);
+        }
+        command.arg(script_path);
+
         match run_command_output(command, dur).await {
             Ok(output) => {
                 let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -85,14 +126,20 @@ async fn run_local_python(code: &str, dur: Duration) -> anyhow::Result<(String, 
         }
     }
 
-    Err(anyhow::anyhow!("no python interpreter found"))
+    Err(anyhow::anyhow!("no local interpreter found for extension {}", lang_cfg.extension))
 }
 
-pub async fn run_python(code: &str, dur: Duration) -> anyhow::Result<(String, String, Option<i32>)> {
-    match run_container_python(code, dur).await {
+pub async fn execute_code(language: &str, code: &str, dur: Duration) -> anyhow::Result<(String, String, Option<i32>)> {
+    let lang_cfg = get_lang_config(language)
+        .ok_or_else(|| anyhow::anyhow!("unsupported language: {}", language))?;
+
+    match run_container_code(&lang_cfg, code, dur).await {
         Ok(result) => Ok(result),
         Err(err) if cfg!(test) || std::env::var("EXECUTOR_LOCAL_FALLBACK").unwrap_or_default() == "1" => {
-            run_local_python(code, dur).await.map_err(|local_err| {
+            let script_path = write_code_to_tempfile_async(code, lang_cfg.extension).await?;
+            let res = run_local_code(&lang_cfg, &script_path, dur).await;
+            cleanup_tempfile(&script_path).await;
+            res.map_err(|local_err| {
                 anyhow::anyhow!("container runner failed: {}; local fallback failed: {}", err, local_err)
             })
         }
@@ -100,15 +147,45 @@ pub async fn run_python(code: &str, dur: Duration) -> anyhow::Result<(String, St
     }
 }
 
-pub async fn run_python_stream(id: String, code: &str, dur: Duration) -> anyhow::Result<()> {
+pub async fn execute_code_stream(id: String, language: &str, code: &str, dur: Duration) -> anyhow::Result<()> {
+    let lang_cfg = get_lang_config(language)
+        .ok_or_else(|| anyhow::anyhow!("unsupported language: {}", language))?;
+
     let started_at = Instant::now();
     // create broadcast channel for logs and register it
     let (tx, _rx) = broadcast::channel(100);
     BROADCASTS.insert(id.clone(), tx.clone());
 
-    let script_path = write_code_to_tempfile_async(code).await?;
+    let script_path = write_code_to_tempfile_async(code, lang_cfg.extension).await?;
     let config = sandbox_config();
-    let mut command = docker_command(&script_path, &config);
+
+    let run_local = if cfg!(test) || std::env::var("EXECUTOR_LOCAL_FALLBACK").unwrap_or_default() == "1" {
+        std::env::var("EXECUTOR_USE_DOCKER").unwrap_or_default() != "1"
+    } else {
+        false
+    };
+
+    let mut command = if run_local {
+        let mut local_cmd = None;
+        for cmd_parts in &lang_cfg.local_cmds {
+            let binary = &cmd_parts[0];
+            let mut cmd = Command::new(binary);
+            for arg in &cmd_parts[1..] {
+                cmd.arg(arg);
+            }
+            cmd.arg(&script_path);
+            local_cmd = Some(cmd);
+            break;
+        }
+        local_cmd.ok_or_else(|| anyhow::anyhow!("no local command configuration available"))?
+    } else {
+        let mut cmd = Command::new("docker");
+        for arg in docker_command_args(&script_path, &config, &lang_cfg) {
+            cmd.arg(arg);
+        }
+        cmd
+    };
+
     command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
 
     // prepare a slot to track the running child so we can cancel it from handlers
@@ -118,22 +195,80 @@ pub async fn run_python_stream(id: String, code: &str, dur: Duration) -> anyhow:
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
-            let err = format!("failed to start sandbox container: {}", e);
-            JOB_STORE.insert(
-                id.clone(),
-                Some(ExecutionResult {
-                    id: id.clone(),
-                    status: "failed".into(),
-                    stdout: "".into(),
-                    stderr: err.clone(),
-                    exit_code: None,
-                    created_at: Some(chrono::Utc::now().timestamp_millis()),
-                }),
-            );
-            let _ = tx.send(format!("ERR: {}", err));
-            BROADCASTS.remove(&id);
-            RUNNING_CHILDREN.remove(&id);
-            return Ok(());
+            if !run_local && (cfg!(test) || std::env::var("EXECUTOR_LOCAL_FALLBACK").unwrap_or_default() == "1") {
+                let mut fallback_cmd = None;
+                for cmd_parts in &lang_cfg.local_cmds {
+                    let binary = &cmd_parts[0];
+                    let mut cmd = Command::new(binary);
+                    for arg in &cmd_parts[1..] {
+                        cmd.arg(arg);
+                    }
+                    cmd.arg(&script_path);
+                    fallback_cmd = Some(cmd);
+                    break;
+                }
+                if let Some(mut cmd) = fallback_cmd {
+                    cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+                    match cmd.spawn() {
+                        Ok(c) => c,
+                        Err(local_e) => {
+                            let err = format!("failed to start sandbox container: {}; local fallback failed: {}", e, local_e);
+                            JOB_STORE.insert(
+                                id.clone(),
+                                Some(ExecutionResult {
+                                    id: id.clone(),
+                                    status: "failed".into(),
+                                    stdout: "".into(),
+                                    stderr: err.clone(),
+                                    exit_code: None,
+                                    created_at: Some(chrono::Utc::now().timestamp_millis()),
+                                }),
+                            );
+                            let _ = tx.send(format!("ERR: {}", err));
+                            BROADCASTS.remove(&id);
+                            RUNNING_CHILDREN.remove(&id);
+                            let _ = cleanup_tempfile(&script_path).await;
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    let err = format!("failed to start sandbox container: {}", e);
+                    JOB_STORE.insert(
+                        id.clone(),
+                        Some(ExecutionResult {
+                            id: id.clone(),
+                            status: "failed".into(),
+                            stdout: "".into(),
+                            stderr: err.clone(),
+                            exit_code: None,
+                            created_at: Some(chrono::Utc::now().timestamp_millis()),
+                        }),
+                    );
+                    let _ = tx.send(format!("ERR: {}", err));
+                    BROADCASTS.remove(&id);
+                    RUNNING_CHILDREN.remove(&id);
+                    let _ = cleanup_tempfile(&script_path).await;
+                    return Ok(());
+                }
+            } else {
+                let err = format!("failed to start sandbox container: {}", e);
+                JOB_STORE.insert(
+                    id.clone(),
+                    Some(ExecutionResult {
+                        id: id.clone(),
+                        status: "failed".into(),
+                        stdout: "".into(),
+                        stderr: err.clone(),
+                        exit_code: None,
+                        created_at: Some(chrono::Utc::now().timestamp_millis()),
+                    }),
+                );
+                let _ = tx.send(format!("ERR: {}", err));
+                BROADCASTS.remove(&id);
+                RUNNING_CHILDREN.remove(&id);
+                let _ = cleanup_tempfile(&script_path).await;
+                return Ok(());
+            }
         }
     };
 
@@ -225,15 +360,15 @@ pub async fn run_python_stream(id: String, code: &str, dur: Duration) -> anyhow:
     Ok(())
 }
 
-fn docker_command(script_path: &Path, config: &SandboxConfig) -> Command {
-    let mut command = Command::new("docker");
-    for arg in docker_command_args(script_path, config) {
-        command.arg(arg);
-    }
-    command
-}
+fn docker_command_args(script_path: &Path, config: &SandboxConfig, lang_cfg: &LangConfig) -> Vec<String> {
+    let sandbox_script_path = format!("{}/main.{}", SANDBOX_DIR, lang_cfg.extension);
+    let image = match lang_cfg.extension {
+        "py" => std::env::var("EXECUTOR_IMAGE_PYTHON").unwrap_or_else(|_| std::env::var("EXECUTOR_IMAGE").unwrap_or_else(|_| lang_cfg.default_image.to_string())),
+        "js" => std::env::var("EXECUTOR_IMAGE_JS").unwrap_or_else(|_| lang_cfg.default_image.to_string()),
+        "sh" => std::env::var("EXECUTOR_IMAGE_BASH").unwrap_or_else(|_| lang_cfg.default_image.to_string()),
+        _ => lang_cfg.default_image.to_string(),
+    };
 
-fn docker_command_args(script_path: &Path, config: &SandboxConfig) -> Vec<String> {
     vec![
         "run".into(),
         "--rm".into(),
@@ -253,19 +388,22 @@ fn docker_command_args(script_path: &Path, config: &SandboxConfig) -> Vec<String
         "--tmpfs".into(),
         format!("{}:rw,noexec,nosuid,size=64m", SANDBOX_DIR),
         "-v".into(),
-        format!("{}:{}:ro", script_path.display(), SANDBOX_SCRIPT_PATH),
-        config.image.clone(),
-        "python".into(),
-        "-u".into(),
-        SANDBOX_SCRIPT_PATH.into(),
+        format!("{}:{}:ro", script_path.display(), sandbox_script_path),
+        image,
+        lang_cfg.docker_cmd[0].clone(),
+        lang_cfg.docker_cmd[1].clone(),
+        sandbox_script_path,
     ]
 }
 
-async fn run_container_python(code: &str, dur: Duration) -> anyhow::Result<(String, String, Option<i32>)> {
-    let script_path = write_code_to_tempfile_async(code).await?;
+async fn run_container_code(lang_cfg: &LangConfig, code: &str, dur: Duration) -> anyhow::Result<(String, String, Option<i32>)> {
+    let script_path = write_code_to_tempfile_async(code, lang_cfg.extension).await?;
     let config = sandbox_config();
 
-    let command = docker_command(&script_path, &config);
+    let mut command = Command::new("docker");
+    for arg in docker_command_args(&script_path, &config, lang_cfg) {
+        command.arg(arg);
+    }
     let output = run_command_output(command, dur).await.map_err(|e| {
         anyhow::anyhow!("failed to start sandbox container: {}", e)
     });
@@ -301,6 +439,7 @@ where
         let _ = tx.send(format!("{} {}", prefix, line));
     }
 }
+
 async fn finalize_job(id: &str, tx: &broadcast::Sender<String>, status: &str, stdout: String, stderr: String, exit_code: Option<i32>) {
     let now = chrono::Utc::now().timestamp_millis();
     let result = ExecutionResult {
@@ -398,14 +537,14 @@ mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
 
-    use axum::{routing::post, Router, extract::Body};
+    use axum::{routing::post, Router};
     use std::sync::Arc;
     use tokio::sync::oneshot;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[tokio::test]
     async fn test_tempfile_lifecycle() {
-        let path = write_code_to_tempfile_async("print('ok')").await.expect("tempfile");
+        let path = write_code_to_tempfile_async("print('ok')", "py").await.expect("tempfile");
         let content = tokio::fs::read_to_string(&path).await.expect("read tempfile");
         assert_eq!(content, "print('ok')");
         cleanup_tempfile(&path).await;
@@ -415,19 +554,18 @@ mod tests {
     #[tokio::test]
     async fn test_docker_command_has_expected_flags() {
         let config = SandboxConfig {
-            image: "python:3.12-slim".into(),
             memory_mb: 256,
             cpus: "1.0".into(),
             pids_limit: 64,
         };
         let path = Path::new("/tmp/main.py");
-        let args = docker_command_args(path, &config);
+        let lang_cfg = get_lang_config("python").unwrap();
+        let args = docker_command_args(path, &config, &lang_cfg);
         assert!(args.contains(&"run".to_string()));
         assert!(args.contains(&"--rm".to_string()));
         assert!(args.contains(&"--network".to_string()));
         assert!(args.contains(&"none".to_string()));
         assert!(args.iter().any(|arg| arg.contains("/tmp/main.py:/sandbox/main.py:ro")));
-        assert!(args.contains(&"python:3.12-slim".to_string()));
     }
 
     #[tokio::test]
@@ -464,10 +602,9 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(0));
         let c_clone = counter.clone();
 
-        let app = Router::new().route("/", post(move |body: Body, headers: axum::http::HeaderMap| {
+        let app = Router::new().route("/", post(move |headers: axum::http::HeaderMap, bytes: axum::body::Bytes| {
             let c = c_clone.clone();
             async move {
-                let bytes = hyper::body::to_bytes(body).await.unwrap_or_default();
                 // verify signature if header present
                 if let Some(sig_hdr) = headers.get("x-signature") {
                     let sig_str = sig_hdr.to_str().unwrap_or_default();
@@ -495,11 +632,10 @@ mod tests {
         // bind to port 0 to get an ephemeral port
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().unwrap();
-        let server = axum::Server::from_tcp(listener).unwrap().serve(app.into_make_service());
-
+        
         let (tx, rx) = oneshot::channel();
         let srv_handle = tokio::spawn(async move {
-            let _ = server.with_graceful_shutdown(async { let _ = rx.await; }).await;
+            let _ = axum::serve(listener, app).with_graceful_shutdown(async { let _ = rx.await; }).await;
         });
 
         let url = format!("http://{}:{}/", addr.ip(), addr.port());

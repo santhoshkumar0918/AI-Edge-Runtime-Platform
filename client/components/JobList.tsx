@@ -234,8 +234,20 @@ export default function JobList() {
           <textarea value={code} onChange={(e) => setCode(e.target.value)} className="w-full h-28 p-2 border rounded text-sm font-mono bg-zinc-50 dark:bg-zinc-950" />
           <div className="flex items-center gap-2">
             <label className="text-sm">Language</label>
-            <select value={language} onChange={(e) => setLanguage(e.target.value)} className="px-2 py-1 border rounded text-sm">
+            <select value={language} onChange={(e) => {
+              const val = e.target.value;
+              setLanguage(val);
+              if (val === "javascript") {
+                setCode("console.log('hello from javascript');\n");
+              } else if (val === "bash") {
+                setCode("echo 'hello from bash'\n");
+              } else {
+                setCode("print('hello from runtime')\n");
+              }
+            }} className="px-2 py-1 border rounded text-sm bg-white dark:bg-zinc-800 text-zinc-950 dark:text-zinc-50">
               <option value="python">python</option>
+              <option value="javascript">javascript</option>
+              <option value="bash">bash</option>
             </select>
             <label className="text-sm">Timeout (ms)</label>
             <input type="number" value={timeoutMs} onChange={(e) => setTimeoutMs(Number(e.target.value))} className="px-2 py-1 border rounded text-sm w-28" />

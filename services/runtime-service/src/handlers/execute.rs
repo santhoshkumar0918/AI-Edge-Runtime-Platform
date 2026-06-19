@@ -45,7 +45,8 @@ fn validate_execution_request(req: &ExecutionRequest) -> Result<u64, String> {
         return Err(format!("code too large (max {} bytes)", max_code));
     }
 
-    if req.language != "python" && req.language != "py" {
+    let lang = req.language.to_lowercase();
+    if lang != "python" && lang != "py" && lang != "javascript" && lang != "js" && lang != "bash" && lang != "sh" {
         return Err("unsupported language".to_string());
     }
 
@@ -100,7 +101,7 @@ pub async fn execute_handler(Json(req): Json<ExecutionRequest>) -> impl IntoResp
     METRICS.record_job_started();
     let timeout_dur = Duration::from_millis(requested);
 
-    let res = executor::run_python(&req.code, timeout_dur).await;
+    let res = executor::execute_code(&req.language, &req.code, timeout_dur).await;
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
     match res {
@@ -164,8 +165,7 @@ pub async fn execute_async_handler(Json(req): Json<ExecutionRequest>) -> impl In
     let id_clone = id.clone();
 
     tokio::spawn(async move {
-        let _ = lang; // language already validated
-        if let Err(err) = executor::run_python_stream(id_clone.clone(), &code, timeout_dur).await {
+        if let Err(err) = executor::execute_code_stream(id_clone.clone(), &lang, &code, timeout_dur).await {
             METRICS.record_job_failed();
             let now = chrono::Utc::now().timestamp_millis();
             let body = ExecutionResult {

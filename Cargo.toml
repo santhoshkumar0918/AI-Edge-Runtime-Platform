@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "services/runtime-service",
+    "services/api-gateway",
+]
+resolver = "2"

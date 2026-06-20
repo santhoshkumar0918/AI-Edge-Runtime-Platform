@@ -84,7 +84,9 @@ async fn forward_request(
         }
     }
 
-    let mut req_builder = state.client.request(method, &url).body(body);
+    let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
+        .unwrap_or(reqwest::Method::GET);
+    let mut req_builder = state.client.request(reqwest_method, &url).body(body);
 
     // Copy incoming headers, skipping Host and Authorization to avoid skews
     for (name, value) in headers.iter() {

@@ -11,7 +11,7 @@ type RuntimeSummary = {
 };
 
 async function loadRuntimeSummary(): Promise<RuntimeSummary | null> {
-  const baseUrl = process.env.NEXT_PUBLIC_RUNTIME_URL ?? process.env.RUNTIME_URL ?? "http://127.0.0.1:8081";
+  const baseUrl = process.env.NEXT_PUBLIC_RUNTIME_URL ?? process.env.RUNTIME_URL ?? "http://127.0.0.1:8080";
   try {
     const response = await fetch(`${baseUrl}/public/summary`, { cache: "no-store" });
     if (!response.ok) return null;

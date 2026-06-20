@@ -6,7 +6,7 @@ type Job = { id: string; status: string; created_at?: number | null };
 
 type Logs = { stdout: string; stderr: string } | null;
 
-const baseUrl = process.env.NEXT_PUBLIC_RUNTIME_URL ?? process.env.RUNTIME_URL ?? "http://127.0.0.1:8081";
+const baseUrl = process.env.NEXT_PUBLIC_RUNTIME_URL ?? process.env.RUNTIME_URL ?? "http://127.0.0.1:8080";
 
 export default function JobList() {
   const [jobs, setJobs] = useState<Job[]>([]);

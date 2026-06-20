@@ -86,10 +86,12 @@ async fn forward_request(
 
     let mut req_builder = state.client.request(method, &url).body(body);
 
-    // Copy incoming headers, skipping Host and Authorization
+    // Copy incoming headers, skipping Host and Authorization to avoid skews
     for (name, value) in headers.iter() {
-        if name != reqwest::header::HOST && name != reqwest::header::AUTHORIZATION {
-            req_builder = req_builder.header(name, value);
+        if name != axum::http::header::HOST && name != axum::http::header::AUTHORIZATION {
+            if let Ok(reqwest_val) = reqwest::header::HeaderValue::from_bytes(value.as_bytes()) {
+                req_builder = req_builder.header(name.as_str(), reqwest_val);
+            }
         }
     }
 
@@ -107,8 +109,10 @@ async fn forward_request(
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             let mut response_headers = HeaderMap::new();
             for (key, val) in resp.headers().iter() {
-                if let Ok(name) = HeaderName::from_bytes(key.as_str().as_bytes()) {
-                    response_headers.insert(name, val.clone());
+                if let Ok(name) = axum::http::HeaderName::from_bytes(key.as_str().as_bytes()) {
+                    if let Ok(value) = axum::http::HeaderValue::from_bytes(val.as_bytes()) {
+                        response_headers.insert(name, value);
+                    }
                 }
             }
             let body_bytes = resp.bytes().await.map_err(|e| {
@@ -271,10 +275,10 @@ async fn handle_socket(client_socket: WebSocket, id: String, state: AppState) {
 
 fn tungstenite_to_axum(msg: tokio_tungstenite::tungstenite::Message) -> Option<AxumMessage> {
     match msg {
-        tokio_tungstenite::tungstenite::Message::Text(t) => Some(AxumMessage::Text(t.into())),
-        tokio_tungstenite::tungstenite::Message::Binary(b) => Some(AxumMessage::Binary(b.into())),
-        tokio_tungstenite::tungstenite::Message::Ping(p) => Some(AxumMessage::Ping(p.into())),
-        tokio_tungstenite::tungstenite::Message::Pong(p) => Some(AxumMessage::Pong(p.into())),
+        tokio_tungstenite::tungstenite::Message::Text(t) => Some(AxumMessage::Text(t.as_str().into())),
+        tokio_tungstenite::tungstenite::Message::Binary(b) => Some(AxumMessage::Binary(axum::body::Bytes::from(b.to_vec()))),
+        tokio_tungstenite::tungstenite::Message::Ping(p) => Some(AxumMessage::Ping(axum::body::Bytes::from(p.to_vec()))),
+        tokio_tungstenite::tungstenite::Message::Pong(p) => Some(AxumMessage::Pong(axum::body::Bytes::from(p.to_vec()))),
         tokio_tungstenite::tungstenite::Message::Close(c) => Some(AxumMessage::Close(c.map(|frame| AxumCloseFrame {
             code: frame.code.into(),
             reason: frame.reason.to_string().into(),
@@ -285,10 +289,10 @@ fn tungstenite_to_axum(msg: tokio_tungstenite::tungstenite::Message) -> Option<A
 
 fn axum_to_tungstenite(msg: AxumMessage) -> Option<tokio_tungstenite::tungstenite::Message> {
     match msg {
-        AxumMessage::Text(t) => Some(tokio_tungstenite::tungstenite::Message::Text(t.to_string())),
-        AxumMessage::Binary(b) => Some(tokio_tungstenite::tungstenite::Message::Binary(b.to_vec())),
-        AxumMessage::Ping(p) => Some(tokio_tungstenite::tungstenite::Message::Ping(p.to_vec())),
-        AxumMessage::Pong(p) => Some(tokio_tungstenite::tungstenite::Message::Pong(p.to_vec())),
+        AxumMessage::Text(t) => Some(tokio_tungstenite::tungstenite::Message::Text(t.as_str().into())),
+        AxumMessage::Binary(b) => Some(tokio_tungstenite::tungstenite::Message::Binary(b.to_vec().into())),
+        AxumMessage::Ping(p) => Some(tokio_tungstenite::tungstenite::Message::Ping(p.to_vec().into())),
+        AxumMessage::Pong(p) => Some(tokio_tungstenite::tungstenite::Message::Pong(p.to_vec().into())),
         AxumMessage::Close(c) => Some(tokio_tungstenite::tungstenite::Message::Close(c.map(|frame| tokio_tungstenite::tungstenite::protocol::CloseFrame {
             code: frame.code.into(),
             reason: frame.reason.to_string().into(),

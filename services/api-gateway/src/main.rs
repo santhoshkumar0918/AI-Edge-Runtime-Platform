@@ -6,9 +6,7 @@ use axum::{
     routing::{get, post, delete},
     Router,
 };
-use std::sync::Arc;
-use tracing::{error, info, warn};
-use reqwest::header::HeaderName;
+use tracing::{error, info};
 use futures_util::{SinkExt, StreamExt};
 
 #[derive(Clone)]

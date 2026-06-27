@@ -1,22 +1,40 @@
 @import "tailwindcss";
 
 :root {
-  --background: #f7f2ea;
-  --foreground: #171717;
+  --background: #ffffff;
+  --foreground: #09090b;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #09090b;
+    --foreground: #fafafa;
+  }
 }
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  
+  /* Animations */
+  --animate-fade-in: fade-in 0.5s ease-out forwards;
+  --animate-fade-in-up: fade-in-up 0.5s ease-out forwards;
+  --animate-pulse-glow: pulse-glow 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0b0f14;
-    --foreground: #ededed;
-  }
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes fade-in-up {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes pulse-glow {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
 }
 
 * {
@@ -31,15 +49,30 @@ body {
   background: var(--background);
   color: var(--foreground);
   font-family: "Inter", "Segoe UI", Helvetica, Arial, sans-serif;
-  background-image:
-    radial-gradient(circle at top left, rgba(255, 255, 255, 0.65), transparent 28%),
-    radial-gradient(circle at right center, rgba(245, 158, 11, 0.16), transparent 22%);
+  /* Beautiful dark mode ambient gradient */
+  background-image: 
+    radial-gradient(circle at 15% 50%, rgba(120, 119, 198, 0.08), transparent 25%),
+    radial-gradient(circle at 85% 30%, rgba(74, 222, 128, 0.08), transparent 25%);
+  background-attachment: fixed;
 }
 
-a {
-  transition: opacity 0.15s ease;
+/* Glass panel utility */
+.glass-panel {
+  @apply bg-white/60 dark:bg-zinc-900/50 backdrop-blur-xl border border-white/20 dark:border-white/10 shadow-xl;
 }
 
-a:hover {
-  opacity: 0.88;
+/* Scrollbar styling for code blocks */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(156, 163, 175, 0.5);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(156, 163, 175, 0.8);
 }
